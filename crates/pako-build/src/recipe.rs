@@ -291,7 +291,10 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
     source.hash.parse::<Sha256Digest>()?;
 
     if source.path.is_some() == source.urls.is_empty() {
-        anyhow::bail!("source {} must define exactly one of path or urls", source.id);
+        anyhow::bail!(
+            "source {} must define exactly one of path or urls",
+            source.id
+        );
     }
 
     if source.format.is_none() {

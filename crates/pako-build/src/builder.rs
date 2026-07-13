@@ -261,9 +261,7 @@ impl Builder {
         }
 
         for url in &source.urls {
-            let result = self
-                .download_mirror(url, expected, &partial)
-                .await;
+            let result = self.download_mirror(url, expected, &partial).await;
             match result {
                 Ok(()) => {
                     tokio::fs::rename(&partial, destination).await?;
