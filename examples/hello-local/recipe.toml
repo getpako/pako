@@ -30,6 +30,10 @@ type = "chmod"
 path = "bin/hello-pako"
 mode = "0755"
 
+[[integrations.launchers]]
+name = "hello-pako"
+target = "bin/hello-pako"
+
 [[assertions]]
 type = "path"
 path = "bin/hello-pako"

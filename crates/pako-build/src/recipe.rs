@@ -290,7 +290,7 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
     validate_simple_identifier(&source.id, "source id")?;
     source.hash.parse::<Sha256Digest>()?;
 
-    if source.path.is_some() == source.urls.is_empty() {
+    if source.path.is_some() == !source.urls.is_empty() {
         anyhow::bail!(
             "source {} must define exactly one of path or urls",
             source.id

@@ -8,7 +8,7 @@ use std::{
 use crate::{
     error::IoContext,
     layout::Layout,
-    manifest::{DesktopEntry, Entry, Icon, Launcher, PackageManifest},
+    manifest::{DesktopEntry, Icon, Launcher, PackageManifest},
     receipt::ExposureReceipt,
     Error, Result, Sha256Digest,
 };
@@ -21,24 +21,6 @@ pub fn install(manifest: &PackageManifest, layout: &Layout) -> Result<Vec<Exposu
 
     for launcher in &manifest.integrations.launchers {
         receipts.push(install_launcher(manifest, launcher, layout)?);
-    }
-
-    let declared_launchers: std::collections::BTreeSet<_> = manifest
-        .integrations
-        .launchers
-        .iter()
-        .map(|launcher| launcher.name.as_str())
-        .collect();
-    for entry in &manifest.entries {
-        let Entry::File { path, mode, .. } = entry else {
-            continue;
-        };
-        let Some(name) = binary_name(path.as_str()) else {
-            continue;
-        };
-        if mode & 0o111 != 0 && !declared_launchers.contains(name) {
-            receipts.push(install_binary(manifest, name, path.as_str(), layout)?);
-        }
     }
 
     for desktop_entry in &manifest.integrations.desktop_entries {
@@ -80,20 +62,6 @@ fn install_launcher(
     let content = render_launcher(&manifest.package, launcher, layout);
     write_exposure(&path, content.as_bytes(), 0o755)?;
     Ok(exposure_receipt("launcher", &path, content.as_bytes()))
-}
-
-fn install_binary(
-    manifest: &PackageManifest,
-    name: &str,
-    target: &str,
-    layout: &Layout,
-) -> Result<ExposureReceipt> {
-    let path = layout.bin.join(name);
-    ensure_available(&path)?;
-
-    let content = render_binary_launcher(&manifest.package, target, layout);
-    write_exposure(&path, content.as_bytes(), 0o755)?;
-    Ok(exposure_receipt("bin", &path, content.as_bytes()))
 }
 
 fn install_desktop_entry(desktop_entry: &DesktopEntry, layout: &Layout) -> Result<ExposureReceipt> {
@@ -151,22 +119,6 @@ fn render_launcher(package: &str, launcher: &Launcher, layout: &Layout) -> Strin
             arguments
         )
     }
-}
-
-fn render_binary_launcher(package: &str, target: &str, layout: &Layout) -> String {
-    let executable = layout
-        .current_link(package)
-        .expect("package name was validated with its manifest")
-        .join(target);
-    format!(
-        "#!/bin/sh\nexec {} \"$@\"\n",
-        shell_quote(&executable.display().to_string())
-    )
-}
-
-fn binary_name(path: &str) -> Option<&str> {
-    let name = path.strip_prefix("bin/")?;
-    (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
 fn render_desktop_entry(entry: &DesktopEntry) -> String {
