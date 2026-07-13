@@ -48,6 +48,7 @@ pub(crate) struct Metadata {
 pub(crate) struct Target {
     #[serde(rename = "target")]
     pub platform: String,
+    #[serde(default)]
     pub build: Build,
     pub sources: Vec<Source>,
     #[serde(default)]
@@ -56,16 +57,9 @@ pub(crate) struct Target {
     pub assertions: Vec<Assertion>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Build {
-    pub kind: String,
-    #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "reserved recipe schema field for selecting source payloads"
-    )]
-    pub payload_source: Option<String>,
     #[serde(default)]
     pub environment: Option<String>,
     #[serde(default)]
@@ -97,6 +91,10 @@ impl Scripts {
             ("check", self.check.as_deref()),
             ("install", self.install.as_deref()),
         ]
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.phases().iter().all(|(_, script)| script.is_none())
     }
 }
 
@@ -254,22 +252,18 @@ fn validate_target(target: &Target) -> anyhow::Result<()> {
         anyhow::bail!("unsupported target {}", target.platform);
     }
 
-    if !matches!(target.build.kind.as_str(), "prebuilt" | "source") {
-        anyhow::bail!("invalid build kind {}", target.build.kind);
-    }
-
     if let Some(shell) = target.build.shell.as_deref() {
         if shell != "bash" {
             anyhow::bail!("unsupported build shell {shell}; schema 1 supports bash only");
         }
     }
 
-    if target.build.kind == "source" {
+    if !target.build.scripts.is_empty() {
         let environment = target
             .build
             .environment
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("source build requires an environment"))?;
+            .ok_or_else(|| anyhow::anyhow!("build scripts require an environment"))?;
         if !environment.contains("@sha256:") {
             anyhow::bail!("build environment must be pinned by OCI digest");
         }
@@ -290,7 +284,7 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
     validate_simple_identifier(&source.id, "source id")?;
     source.hash.parse::<Sha256Digest>()?;
 
-    if source.path.is_some() == !source.urls.is_empty() {
+    if source.path.is_some() != source.urls.is_empty() {
         anyhow::bail!(
             "source {} must define exactly one of path or urls",
             source.id

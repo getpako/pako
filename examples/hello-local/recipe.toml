@@ -16,9 +16,6 @@ license = "MIT"
 [[targets]]
 target = "linux/x86_64"
 
-[targets.build]
-kind = "prebuilt"
-
 [[targets.sources]]
 id = "hello-pako"
 path = "payload/hello-pako"

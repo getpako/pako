@@ -74,7 +74,7 @@ impl Builder {
         let workspace = BuildWorkspace::create()?;
         self.prepare_sources(recipe, target, &workspace).await?;
 
-        if target.build.kind == "source" {
+        if !target.build.scripts.is_empty() {
             self.run_source_build(recipe, target, &workspace).await?;
         }
 

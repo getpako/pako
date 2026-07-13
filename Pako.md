@@ -2125,35 +2125,21 @@ Each architecture may define different sources:
 [[targets]]
 target = "linux/x86_64"
 
-[targets.build]
-kind = "prebuilt"
-payload_root = "payload"
-
 [[targets.sources]]
 id = "upstream"
-kind = "archive"
 urls = ["https://example.org/app-linux-x86_64.tar.gz"]
-sha256 = "..."
-size = 123456789
+hash = "sha256:..."
 format = "tar.gz"
-destination = "payload"
 strip_components = 1
 
 [[targets]]
 target = "linux/aarch64"
 
-[targets.build]
-kind = "prebuilt"
-payload_root = "payload"
-
 [[targets.sources]]
 id = "upstream"
-kind = "archive"
 urls = ["https://example.org/app-linux-aarch64.tar.gz"]
-sha256 = "..."
-size = 120000000
+hash = "sha256:..."
 format = "tar.gz"
-destination = "payload"
 strip_components = 1
 ```
 
@@ -2190,12 +2176,10 @@ Conceptual configuration:
 
 ```toml
 [targets.build]
-kind = "source"
 environment = "ghcr.io/getpako/build-images/linux-x86_64-v1@sha256:..."
 shell = "bash"
 network = false
 timeout_seconds = 7200
-payload_root = "dest"
 
 [targets.build.scripts]
 configure = """

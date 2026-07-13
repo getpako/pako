@@ -15,9 +15,6 @@ license = "LicenseRef-JetBrains-IntelliJ-IDEA"
 
 [[targets]]
 target = "linux/x86_64"
-[targets.build]
-kind = "prebuilt"
-payload_source = "upstream"
 [[targets.sources]]
 id = "upstream"
 urls = ["https://example.invalid/idea-linux-x86_64.tar.gz"]
@@ -27,9 +24,6 @@ strip_components = 1
 
 [[targets]]
 target = "linux/aarch64"
-[targets.build]
-kind = "prebuilt"
-payload_source = "upstream"
 [[targets.sources]]
 id = "upstream"
 urls = ["https://example.invalid/idea-linux-aarch64.tar.gz"]

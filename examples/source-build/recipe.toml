@@ -16,7 +16,6 @@ license = "MIT"
 [[targets]]
 target = "linux/x86_64"
 [targets.build]
-kind = "source"
 environment = "ghcr.io/getpako/build-images/linux-x86_64-v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 network = false
 timeout_seconds = 3600
