@@ -52,7 +52,7 @@ impl Builder {
     pub(crate) fn new(output: PathBuf) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60 * 60))
+            .timeout(Duration::from_hours(1))
             .user_agent(concat!("pako-build/", env!("CARGO_PKG_VERSION")))
             .build()?;
 
