@@ -1,0 +1,757 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use futures_util::StreamExt;
+use pako_core::{
+    canonical,
+    chunking::{Chunker, PakoFastCdcV1},
+    manifest::{
+        ChunkLocation, ChunkRef, ChunkingProfile, DesktopEntry, Entry, Icon, Integrations,
+        Launcher, PackDescriptor, PackIndex, PackageManifest, PackageMetadata, Policies,
+        PACKAGE_MANIFEST_MEDIA_TYPE,
+    },
+    pack::{PackWriter, SOFT_PACK_LIMIT},
+    path::{validate_symlink_target, PackagePath},
+    verify::compute_tree_digest,
+    Sha256Digest,
+};
+use sha2::{Digest as _, Sha256};
+use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
+use walkdir::WalkDir;
+
+use crate::{
+    archive,
+    recipe::{Assertion, Recipe, Source, Target, Transform},
+    sandbox::Sandbox,
+};
+
+#[derive(Debug, Clone)]
+pub(crate) struct BuildReport {
+    pub package: String,
+    pub version: String,
+    pub target: String,
+    pub package_manifest: PathBuf,
+    pub pack_index: PathBuf,
+    pub output: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct Builder {
+    output: PathBuf,
+    http: reqwest::Client,
+}
+
+impl Builder {
+    pub(crate) fn new(output: PathBuf) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60 * 60))
+            .user_agent(concat!("pako-build/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+
+        Ok(Self { output, http })
+    }
+
+    pub(crate) async fn build(
+        &self,
+        recipe: &Recipe,
+        target_name: &str,
+    ) -> anyhow::Result<BuildReport> {
+        recipe.validate()?;
+        let target = recipe
+            .targets
+            .iter()
+            .find(|candidate| candidate.platform == target_name)
+            .ok_or_else(|| anyhow::anyhow!("target not found: {target_name}"))?;
+
+        let workspace = BuildWorkspace::create()?;
+        self.prepare_sources(recipe, target, &workspace).await?;
+
+        if target.build.kind == "source" {
+            self.run_source_build(recipe, target, &workspace).await?;
+        }
+
+        apply_transforms(&workspace.payload, &recipe.transforms)?;
+        apply_transforms(&workspace.payload, &target.transforms)?;
+        check_assertions(&workspace.payload, &recipe.assertions)?;
+        check_assertions(&workspace.payload, &target.assertions)?;
+
+        self.package_payload(recipe, target, &workspace.payload)
+    }
+
+    async fn prepare_sources(
+        &self,
+        recipe: &Recipe,
+        target: &Target,
+        workspace: &BuildWorkspace,
+    ) -> anyhow::Result<()> {
+        for source in &target.sources {
+            let downloaded = workspace.sources.join(&source.id);
+            self.download_source(source, recipe.recipe_dir(), &downloaded)
+                .await?;
+
+            match source.kind.as_str() {
+                "archive" => {
+                    let format = source
+                        .format
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("archive format is required"))?;
+                    archive::extract(
+                        &downloaded,
+                        format,
+                        &workspace.payload,
+                        source.strip_components,
+                    )?;
+                }
+                "file" => {
+                    let destination = source.destination.as_deref().unwrap_or(&source.id);
+                    let destination =
+                        PackagePath::new(destination.to_owned())?.join_to(&workspace.payload);
+                    if let Some(parent) = destination.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::copy(&downloaded, destination)?;
+                }
+                other => anyhow::bail!("unsupported source kind {other}"),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_source_build(
+        &self,
+        recipe: &Recipe,
+        target: &Target,
+        workspace: &BuildWorkspace,
+    ) -> anyhow::Result<()> {
+        let image = target
+            .build
+            .environment
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("source build requires an environment"))?;
+        let sandbox = Sandbox {
+            image,
+            network: target.build.network,
+            timeout: Duration::from_secs(target.build.timeout_seconds.unwrap_or(3600)),
+        };
+        let environment = build_environment(target);
+
+        for (phase, script) in target.build.scripts.phases() {
+            let Some(script) = script else {
+                continue;
+            };
+
+            sandbox
+                .run(
+                    phase,
+                    script,
+                    recipe.recipe_dir(),
+                    &workspace.payload,
+                    &workspace.build,
+                    &workspace.destination,
+                    &environment,
+                )
+                .await?;
+        }
+
+        if workspace.destination.read_dir()?.next().is_none() {
+            anyhow::bail!("source build produced an empty PAKO_DESTDIR");
+        }
+
+        std::fs::remove_dir_all(&workspace.payload)?;
+        std::fs::rename(&workspace.destination, &workspace.payload)?;
+        Ok(())
+    }
+
+    fn package_payload(
+        &self,
+        recipe: &Recipe,
+        target: &Target,
+        payload: &Path,
+    ) -> anyhow::Result<BuildReport> {
+        let version = format!("{}-{}", recipe.package.version, recipe.package.release);
+        let output = self
+            .output
+            .join(&recipe.package.name)
+            .join(&version)
+            .join(target.platform.replace('/', "_"));
+        if output.exists() {
+            anyhow::bail!(
+                "build output already exists; remove it before rebuilding: {}",
+                output.display()
+            );
+        }
+        std::fs::create_dir_all(&output)?;
+
+        let chunks_directory = output.join("chunks");
+        std::fs::create_dir_all(&chunks_directory)?;
+
+        let mut entries = scan_tree(payload, &chunks_directory)?;
+        entries.sort_by(|left, right| left.path().cmp(right.path()));
+
+        let tree_digest = compute_tree_digest(&entries);
+        let manifest = PackageManifest {
+            schema_version: 1,
+            media_type: PACKAGE_MANIFEST_MEDIA_TYPE.into(),
+            package: recipe.package.name.clone(),
+            upstream_version: recipe.package.version.clone(),
+            release: recipe.package.release,
+            target: target.platform.clone(),
+            metadata: PackageMetadata {
+                display_name: recipe.metadata.display_name.clone(),
+                summary: recipe.metadata.summary.clone(),
+                description: recipe.metadata.description.clone(),
+                vendor: recipe.metadata.vendor.clone(),
+                homepage: recipe.metadata.homepage.clone(),
+                license: recipe.metadata.license.clone(),
+            },
+            chunking: ChunkingProfile::default(),
+            tree_digest,
+            entries,
+            integrations: convert_integrations(recipe)?,
+            policies: Policies {
+                payload_mutation: recipe.policies.payload_mutation.clone(),
+                self_update: recipe.policies.self_update.clone(),
+                user_data: recipe.policies.user_data.clone(),
+            },
+        };
+        manifest.validate()?;
+
+        let manifest_bytes = canonical::to_vec(&manifest)?;
+        let manifest_digest = Sha256Digest::calculate(&manifest_bytes);
+        let manifest_path = output.join("package-manifest.json");
+        std::fs::write(&manifest_path, &manifest_bytes)?;
+
+        let index = build_packs(
+            &manifest,
+            &chunks_directory,
+            &output.join("packs"),
+            manifest_digest,
+        )?;
+        index.validate_against(&manifest)?;
+
+        let index_path = output.join("pack-index.json");
+        std::fs::write(&index_path, canonical::to_vec(&index)?)?;
+        std::fs::remove_dir_all(chunks_directory)?;
+
+        Ok(BuildReport {
+            package: recipe.package.name.clone(),
+            version,
+            target: target.platform.clone(),
+            package_manifest: manifest_path,
+            pack_index: index_path,
+            output,
+        })
+    }
+
+    async fn download_source(
+        &self,
+        source: &Source,
+        recipe_directory: &Path,
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        let expected: Sha256Digest = source.sha256.parse()?;
+        let partial = destination.with_extension("partial");
+
+        for url in &source.urls {
+            let result = if let Some(path) = url.strip_prefix("file:") {
+                self.copy_local_source(path, recipe_directory, source.size, expected, &partial)
+                    .await
+            } else {
+                self.download_mirror(url, source.size, expected, &partial)
+                    .await
+            };
+            match result {
+                Ok(()) => {
+                    tokio::fs::rename(&partial, destination).await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                    eprintln!("source mirror failed for {}: {error:#}", source.id);
+                }
+            }
+        }
+
+        anyhow::bail!("all source mirrors failed for {}", source.id)
+    }
+
+    async fn copy_local_source(
+        &self,
+        relative_path: &str,
+        recipe_directory: &Path,
+        expected_size: Option<u64>,
+        expected_digest: Sha256Digest,
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        let recipe_directory = std::fs::canonicalize(recipe_directory)?;
+        let source = std::fs::canonicalize(recipe_directory.join(relative_path))?;
+        if !source.starts_with(&recipe_directory) {
+            anyhow::bail!("local source is outside the recipe directory");
+        }
+
+        let size = std::fs::metadata(&source)?.len();
+        if let Some(expected_size) = expected_size {
+            if size != expected_size {
+                anyhow::bail!("source size mismatch: expected {expected_size}, got {size}");
+            }
+        }
+
+        let (digest, _) = Sha256Digest::calculate_reader(std::fs::File::open(&source)?)?;
+        if digest != expected_digest {
+            anyhow::bail!("source digest mismatch: expected {expected_digest}, got {digest}");
+        }
+
+        tokio::fs::copy(source, destination).await?;
+        Ok(())
+    }
+
+    async fn download_mirror(
+        &self,
+        url: &str,
+        expected_size: Option<u64>,
+        expected_digest: Sha256Digest,
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        let mut stream = response.bytes_stream();
+        let mut output = tokio::fs::File::create(destination).await?;
+        let mut hash = Sha256::new();
+        let mut size = 0_u64;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            output.write_all(&chunk).await?;
+            hash.update(&chunk);
+            size = size
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("source size overflow"))?;
+        }
+
+        output.sync_all().await?;
+
+        if let Some(expected_size) = expected_size {
+            if size != expected_size {
+                anyhow::bail!("source size mismatch: expected {expected_size}, got {size}");
+            }
+        }
+
+        let actual = Sha256Digest::from_bytes(hash.finalize().into());
+        if actual != expected_digest {
+            anyhow::bail!("source digest mismatch: expected {expected_digest}, got {actual}");
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BuildWorkspace {
+    _temporary: TempDir,
+    sources: PathBuf,
+    payload: PathBuf,
+    build: PathBuf,
+    destination: PathBuf,
+}
+
+impl BuildWorkspace {
+    fn create() -> anyhow::Result<Self> {
+        let temporary = TempDir::new()?;
+        let sources = temporary.path().join("sources");
+        let payload = temporary.path().join("payload");
+        let build = temporary.path().join("build");
+        let destination = temporary.path().join("dest");
+
+        for path in [&sources, &payload, &build, &destination] {
+            std::fs::create_dir_all(path)?;
+        }
+
+        Ok(Self {
+            _temporary: temporary,
+            sources,
+            payload,
+            build,
+            destination,
+        })
+    }
+}
+
+fn build_environment(target: &Target) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("PAKO_RECIPE_DIR".into(), "/pako/recipe".into()),
+        ("PAKO_SOURCE_DIR".into(), "/pako/source".into()),
+        ("PAKO_BUILD_DIR".into(), "/pako/build".into()),
+        ("PAKO_DESTDIR".into(), "/pako/dest".into()),
+        ("PAKO_TARGET".into(), target.platform.clone()),
+        (
+            "PAKO_JOBS".into(),
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .to_string(),
+        ),
+        ("HOME".into(), "/tmp/home".into()),
+        ("SOURCE_DATE_EPOCH".into(), "0".into()),
+    ])
+}
+
+fn scan_tree(root: &Path, chunks_directory: &Path) -> anyhow::Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+
+    for item in WalkDir::new(root)
+        .follow_links(false)
+        .min_depth(1)
+        .sort_by_file_name()
+    {
+        let item = item?;
+        let path = item.path();
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non UTF-8 path"))?;
+        let relative = PackagePath::new(relative.to_owned())?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        let mode = (metadata.permissions().mode() & 0o777) as u16;
+
+        if metadata.is_dir() {
+            entries.push(Entry::Directory {
+                path: relative,
+                mode,
+            });
+        } else if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(path)?
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non UTF-8 symlink target"))?
+                .to_owned();
+            validate_symlink_target(&relative, &target)?;
+            entries.push(Entry::Symlink {
+                path: relative,
+                target,
+            });
+        } else if metadata.is_file() {
+            entries.push(scan_file(
+                path,
+                relative,
+                mode,
+                &metadata,
+                chunks_directory,
+            )?);
+        } else {
+            anyhow::bail!("unsupported filesystem entry: {}", path.display());
+        }
+    }
+
+    Ok(entries)
+}
+
+fn scan_file(
+    path: &Path,
+    package_path: PackagePath,
+    mode: u16,
+    metadata: &std::fs::Metadata,
+    chunks_directory: &Path,
+) -> anyhow::Result<Entry> {
+    let mut file = File::open(path)?;
+    let boundaries = PakoFastCdcV1.boundaries(&mut file)?;
+    let mut chunks = Vec::with_capacity(boundaries.len());
+    let mut file_hash = Sha256::new();
+
+    for boundary in boundaries {
+        file.seek(SeekFrom::Start(boundary.offset))?;
+        let mut bytes = vec![0_u8; boundary.length as usize];
+        file.read_exact(&mut bytes)?;
+        file_hash.update(&bytes);
+
+        let digest = Sha256Digest::calculate(&bytes);
+        let chunk_path = chunks_directory.join(digest.hex());
+        if !chunk_path.exists() {
+            std::fs::write(&chunk_path, &bytes)?;
+        }
+
+        chunks.push(ChunkRef {
+            digest,
+            size: boundary.length,
+        });
+    }
+
+    let digest = if metadata.len() == 0 {
+        Sha256Digest::EMPTY
+    } else {
+        Sha256Digest::from_bytes(file_hash.finalize().into())
+    };
+
+    Ok(Entry::File {
+        path: package_path,
+        mode,
+        size: metadata.len(),
+        digest,
+        chunks,
+    })
+}
+
+fn build_packs(
+    manifest: &PackageManifest,
+    chunks_directory: &Path,
+    packs_directory: &Path,
+    manifest_digest: Sha256Digest,
+) -> anyhow::Result<PackIndex> {
+    std::fs::create_dir_all(packs_directory)?;
+
+    let required: BTreeSet<_> = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::File { chunks, .. } => Some(chunks),
+            Entry::Directory { .. } | Entry::Symlink { .. } => None,
+        })
+        .flatten()
+        .map(|chunk| chunk.digest)
+        .collect();
+
+    let mut packs = BTreeMap::new();
+    let mut locations = BTreeMap::new();
+    let mut writer = PackWriter::new();
+
+    for digest in required {
+        let bytes = std::fs::read(chunks_directory.join(digest.hex()))?;
+        let would_exceed_soft_limit = writer.estimated_stored_size() > 0
+            && writer.estimated_stored_size() + bytes.len() as u64 > SOFT_PACK_LIMIT;
+
+        if would_exceed_soft_limit {
+            flush_pack(writer, packs_directory, &mut packs, &mut locations)?;
+            writer = PackWriter::new();
+        }
+
+        writer.add(&bytes)?;
+    }
+
+    if writer.estimated_stored_size() > 0 {
+        flush_pack(writer, packs_directory, &mut packs, &mut locations)?;
+    }
+
+    Ok(PackIndex {
+        schema: "pako.pack-index.v1".into(),
+        package_manifest_digest: manifest_digest,
+        packs,
+        chunks: locations,
+    })
+}
+
+fn flush_pack(
+    writer: PackWriter,
+    directory: &Path,
+    packs: &mut BTreeMap<Sha256Digest, PackDescriptor>,
+    locations: &mut BTreeMap<Sha256Digest, ChunkLocation>,
+) -> anyhow::Result<()> {
+    let temporary = directory.join("building.pakopack");
+    let (pack_digest, entries) = writer.finish(&temporary)?;
+    let final_path = directory.join(format!("{}.pakopack", pack_digest.hex()));
+
+    if final_path.exists() {
+        std::fs::remove_file(&temporary)?;
+    } else {
+        std::fs::rename(&temporary, &final_path)?;
+    }
+
+    let size = std::fs::metadata(&final_path)?.len();
+    packs.insert(pack_digest, PackDescriptor { size });
+
+    for entry in entries {
+        locations.insert(
+            entry.digest,
+            ChunkLocation {
+                pack: pack_digest,
+                offset: entry.data_offset,
+                stored_size: entry.stored_size,
+                raw_size: entry.raw_size,
+                compression: entry.compression,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn apply_transforms(root: &Path, transforms: &[Transform]) -> anyhow::Result<()> {
+    for transform in transforms {
+        apply_transform(root, transform)?;
+    }
+    Ok(())
+}
+
+fn apply_transform(root: &Path, transform: &Transform) -> anyhow::Result<()> {
+    match transform {
+        Transform::Remove { paths, required } => {
+            for path in paths {
+                let path = payload_path(root, path)?;
+                if path.symlink_metadata().is_err() {
+                    if *required {
+                        anyhow::bail!("required path is missing: {}", path.display());
+                    }
+                    continue;
+                }
+
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if metadata.is_dir() {
+                    std::fs::remove_dir_all(&path)?;
+                } else {
+                    std::fs::remove_file(&path)?;
+                }
+            }
+        }
+        Transform::Chmod { path, mode } => {
+            let path = payload_path(root, path)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(parse_mode(mode)?))?;
+        }
+        Transform::Move { from, to } => {
+            let from = payload_path(root, from)?;
+            let to = payload_path(root, to)?;
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(from, to)?;
+        }
+        Transform::Copy { from, to } => {
+            let from = payload_path(root, from)?;
+            let to = payload_path(root, to)?;
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(from, to)?;
+        }
+        Transform::Write {
+            path,
+            mode,
+            content,
+        } => {
+            let path = payload_path(root, path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(parse_mode(mode)?))?;
+        }
+        Transform::Symlink { path, target } => {
+            let package_path = PackagePath::new(path.clone())?;
+            validate_symlink_target(&package_path, target)?;
+            let path = package_path.join_to(root);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(target, path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn check_assertions(root: &Path, assertions: &[Assertion]) -> anyhow::Result<()> {
+    for assertion in assertions {
+        match assertion {
+            Assertion::Path {
+                path,
+                kind,
+                executable,
+            } => {
+                let path = payload_path(root, path)?;
+                let metadata = std::fs::symlink_metadata(&path)?;
+                let kind_matches = match kind.as_str() {
+                    "file" => metadata.is_file(),
+                    "directory" => metadata.is_dir(),
+                    "symlink" => metadata.file_type().is_symlink(),
+                    "file-or-symlink" => metadata.is_file() || metadata.file_type().is_symlink(),
+                    other => anyhow::bail!("unsupported assertion kind {other}"),
+                };
+
+                if !kind_matches {
+                    anyhow::bail!("path assertion failed for {}", path.display());
+                }
+                if *executable && metadata.permissions().mode() & 0o111 == 0 {
+                    anyhow::bail!("path is not executable: {}", path.display());
+                }
+            }
+            Assertion::Absent { path } => {
+                let path = payload_path(root, path)?;
+                if path.symlink_metadata().is_ok() {
+                    anyhow::bail!("path must be absent: {}", path.display());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn payload_path(root: &Path, value: &str) -> anyhow::Result<PathBuf> {
+    Ok(PackagePath::new(value.to_owned())?.join_to(root))
+}
+
+fn parse_mode(value: &str) -> anyhow::Result<u32> {
+    let value = value
+        .strip_prefix("0o")
+        .or_else(|| value.strip_prefix('0'))
+        .unwrap_or(value);
+    let mode = u32::from_str_radix(value, 8)?;
+
+    if mode & !0o777 != 0 {
+        anyhow::bail!("forbidden permission bits in mode {value}");
+    }
+
+    Ok(mode)
+}
+
+fn convert_integrations(recipe: &Recipe) -> anyhow::Result<Integrations> {
+    let launchers = recipe
+        .integrations
+        .launchers
+        .iter()
+        .map(|launcher| {
+            Ok(Launcher {
+                name: launcher.name.clone(),
+                target: PackagePath::new(launcher.target.clone())?,
+                arguments: launcher.arguments.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let desktop_entries = recipe
+        .integrations
+        .desktop_entries
+        .iter()
+        .map(|entry| DesktopEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            exec: entry.exec.clone(),
+            icon: entry.icon.clone(),
+            terminal: entry.terminal,
+            categories: entry.categories.clone(),
+        })
+        .collect();
+
+    let icons = recipe
+        .integrations
+        .icons
+        .iter()
+        .map(|icon| {
+            Ok(Icon {
+                name: icon.name.clone(),
+                source: PackagePath::new(icon.source.clone())?,
+                context: icon.context.clone(),
+                size: icon.size.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(Integrations {
+        launchers,
+        desktop_entries,
+        icons,
+    })
+}

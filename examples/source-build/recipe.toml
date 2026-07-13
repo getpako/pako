@@ -1,0 +1,58 @@
+schema = 1
+
+[package]
+name = "example-editor"
+version = "1.0.0"
+release = 1
+
+[metadata]
+display_name = "Example Editor"
+summary = "Example source-built application"
+description = "A minimal example showing the source build phases."
+vendor = "Example Project"
+homepage = "https://example.invalid/"
+license = "MIT"
+
+[distribution]
+redistribution = "allowed"
+license_files = ["LICENSE"]
+
+[policies]
+payload_mutation = "deny"
+self_update = "external"
+user_data = "external"
+
+[[targets]]
+target = "linux/x86_64"
+[targets.build]
+kind = "source"
+environment = "ghcr.io/getpako/build-images/linux-x86_64-v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+network = false
+timeout_seconds = 3600
+[targets.build.scripts]
+configure = '''
+cmake -S "$PAKO_SOURCE_DIR" -B "$PAKO_BUILD_DIR" -G Ninja -DCMAKE_INSTALL_PREFIX=/
+'''
+build = '''
+cmake --build "$PAKO_BUILD_DIR" --parallel "$PAKO_JOBS"
+'''
+check = '''
+ctest --test-dir "$PAKO_BUILD_DIR" --output-on-failure
+'''
+install = '''
+DESTDIR="$PAKO_DESTDIR" cmake --install "$PAKO_BUILD_DIR"
+'''
+[[targets.sources]]
+id = "source"
+kind = "archive"
+urls = ["https://example.invalid/example-editor-1.0.0.tar.gz"]
+sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size = 1
+format = "tar.gz"
+strip_components = 1
+
+[[assertions]]
+type = "path"
+path = "bin/example-editor"
+kind = "file"
+executable = true

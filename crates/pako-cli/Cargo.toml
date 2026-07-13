@@ -1,0 +1,27 @@
+[package]
+name = "pako-cli"
+description = "Pako command-line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pako"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+pako-core = { path = "../pako-core" }
+pako-oci = { path = "../pako-oci" }
+pako-trust = { path = "../pako-trust" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+[package]
+name = "pako-build"
+description = "Recipe builder and OCI publisher for Pako"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pako-build"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+aws-lc-rs.workspace = true
+clap.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+jiff.workspace = true
+pako-core = { path = "../pako-core" }
+pako-oci = { path = "../pako-oci" }
+reqwest.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tough.workspace = true
+url.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

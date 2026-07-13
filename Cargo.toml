@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pako-core",
+    "crates/pako-cli",
+    "crates/pako-build",
+    "crates/pako-oci",
+    "crates/pako-trust",
+    "crates/pako-test-support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/getpako/pako"
+authors = ["Oskar Karpiński <karpinski.oskar@outlook.com>"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+aws-lc-rs = "1.17"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1.9"
+clap = { version = "4.5", features = ["derive", "env"] }
+directories = "6.0"
+flate2 = "1.0"
+fs2 = "0.4"
+futures-util = "0.3"
+hex = "0.4"
+indicatif = "0.17"
+jiff = "0.2"
+libc = "0.2"
+ring = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3.15"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tough = { version = "0.24", features = ["http"] }
+url = { version = "2.5", features = ["serde"] }
+walkdir = "2.5"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

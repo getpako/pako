@@ -1,0 +1,28 @@
+[package]
+name = "pako-core"
+description = "Core package model and installation engine for Pako"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+directories.workspace = true
+fs2.workspace = true
+hex.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+pako-test-support = { path = "../pako-test-support" }
+
+[lints]
+workspace = true

@@ -1,0 +1,86 @@
+schema = 1
+
+[package]
+name = "intellij-idea"
+version = "2026.1"
+release = 1
+
+[metadata]
+display_name = "IntelliJ IDEA"
+summary = "Integrated development environment for Java and Kotlin"
+description = "IntelliJ IDEA is an integrated development environment for JVM technologies."
+vendor = "JetBrains"
+homepage = "https://www.jetbrains.com/idea/"
+license = "LicenseRef-JetBrains-IntelliJ-IDEA"
+
+[distribution]
+redistribution = "unknown"
+license_files = ["license"]
+
+[policies]
+payload_mutation = "deny"
+self_update = "external"
+user_data = "external"
+
+[[targets]]
+target = "linux/x86_64"
+[targets.build]
+kind = "prebuilt"
+payload_source = "upstream"
+[[targets.sources]]
+id = "upstream"
+kind = "archive"
+urls = ["https://example.invalid/idea-linux-x86_64.tar.gz"]
+sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size = 1
+format = "tar.gz"
+strip_components = 1
+
+[[targets]]
+target = "linux/aarch64"
+[targets.build]
+kind = "prebuilt"
+payload_source = "upstream"
+[[targets.sources]]
+id = "upstream"
+kind = "archive"
+urls = ["https://example.invalid/idea-linux-aarch64.tar.gz"]
+sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size = 1
+format = "tar.gz"
+strip_components = 1
+
+[[transforms]]
+type = "remove"
+paths = ["Install-Linux-tar.txt"]
+required = false
+
+[[transforms]]
+type = "chmod"
+path = "bin/idea.sh"
+mode = "0755"
+
+[[assertions]]
+type = "path"
+path = "bin/idea.sh"
+kind = "file"
+executable = true
+
+[[integrations.launchers]]
+name = "intellij-idea"
+target = "bin/idea.sh"
+arguments = []
+
+[[integrations.desktop_entries]]
+id = "intellij-idea"
+name = "IntelliJ IDEA"
+exec = "intellij-idea %F"
+icon = "pako-intellij-idea"
+terminal = false
+categories = ["Development", "IDE"]
+
+[[integrations.icons]]
+name = "pako-intellij-idea"
+source = "bin/idea.svg"
+context = "apps"
+size = "scalable"

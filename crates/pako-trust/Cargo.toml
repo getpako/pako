@@ -1,0 +1,21 @@
+[package]
+name = "pako-trust"
+description = "TUF-backed repository trust for Pako"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+pako-core = { path = "../pako-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tough.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
