@@ -1,38 +1,17 @@
 schema = 1
-
-[package]
 name = "hello-local"
 version = "1.0.0"
 release = 3
-
-[metadata]
-display_name = "Hello Local"
 summary = "Small offline pako-build smoke test"
 description = "Packages one local shell script without downloading or compiling anything."
 vendor = "Pako"
 homepage = "https://example.invalid/pako"
 license = "MIT"
+executables = ["bin/hello-pako"]
 
-[[targets]]
-target = "linux/x86_64"
+[commands]
+hello-pako = "bin/hello-pako"
 
-[[targets.sources]]
-id = "hello-pako"
+[source.x86_64]
 path = "payload/hello-pako"
-hash = "sha256:d046a7e56c4adfb3a8f25aff4e08af7276ab2ad106dffdf71d2c9dff657f380c"
-destination = "bin/hello-pako"
-
-[[transforms]]
-type = "chmod"
-path = "bin/hello-pako"
-mode = "0755"
-
-[[integrations.launchers]]
-name = "hello-pako"
-target = "bin/hello-pako"
-
-[[assertions]]
-type = "path"
-path = "bin/hello-pako"
-kind = "file"
-executable = true
+to = "bin/hello-pako"

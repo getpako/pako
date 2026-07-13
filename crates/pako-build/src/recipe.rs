@@ -1,3 +1,5 @@
+mod format;
+
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -206,15 +208,9 @@ pub(crate) struct Icon {
 }
 
 impl Recipe {
+    /// Load and normalize the concise, human-maintained recipe format.
     pub(crate) fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let mut recipe: Self = toml::from_str(&text)?;
-        let parent = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .canonicalize()?;
-        recipe.directory = parent;
-        Ok(recipe)
+        format::load(path)
     }
 
     pub(crate) fn recipe_dir(&self) -> &Path {
@@ -234,6 +230,10 @@ impl Recipe {
             anyhow::bail!("release must be positive");
         }
 
+        if self.targets.is_empty() {
+            anyhow::bail!("recipe must define at least one source or build target");
+        }
+
         let mut targets = BTreeSet::new();
         for target in &self.targets {
             validate_target(target)?;
@@ -250,6 +250,10 @@ impl Recipe {
 fn validate_target(target: &Target) -> anyhow::Result<()> {
     if !matches!(target.platform.as_str(), "linux/x86_64" | "linux/aarch64") {
         anyhow::bail!("unsupported target {}", target.platform);
+    }
+
+    if target.sources.is_empty() && target.build.scripts.is_empty() {
+        anyhow::bail!("target {} has no sources or build script", target.platform);
     }
 
     if let Some(shell) = target.build.shell.as_deref() {
@@ -284,6 +288,20 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
     validate_simple_identifier(&source.id, "source id")?;
     source.hash.parse::<Sha256Digest>()?;
 
+    if let Some(format) = source.format.as_deref() {
+        if !matches!(format, "tar.gz" | "tar" | "zip") {
+            anyhow::bail!("unsupported archive format {format}");
+        }
+        if source.destination.is_some() {
+            anyhow::bail!("archive source {} cannot define a destination", source.id);
+        }
+    } else if source.strip_components != 0 {
+        anyhow::bail!(
+            "non-archive source {} cannot strip path components",
+            source.id
+        );
+    }
+
     if source.path.is_some() != source.urls.is_empty() {
         anyhow::bail!(
             "source {} must define exactly one of path or urls",
@@ -301,6 +319,17 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
 }
 
 fn validate_integrations(integrations: &Integrations) -> anyhow::Result<()> {
+    let mut desktop_entry_ids = BTreeSet::new();
+    for entry in &integrations.desktop_entries {
+        validate_simple_identifier(&entry.id, "desktop entry id")?;
+        if entry.exec.trim().is_empty() {
+            anyhow::bail!("desktop entry {} has an empty command", entry.id);
+        }
+        if !desktop_entry_ids.insert(entry.id.as_str()) {
+            anyhow::bail!("duplicate desktop entry {}", entry.id);
+        }
+    }
+
     let mut launcher_names = BTreeSet::new();
     for launcher in &integrations.launchers {
         validate_simple_identifier(&launcher.name, "launcher name")?;
@@ -310,9 +339,13 @@ fn validate_integrations(integrations: &Integrations) -> anyhow::Result<()> {
         }
     }
 
+    let mut icon_names = BTreeSet::new();
     for icon in &integrations.icons {
         validate_simple_identifier(&icon.name, "icon name")?;
         PackagePath::new(icon.source.clone())?;
+        if !icon_names.insert(icon.name.as_str()) {
+            anyhow::bail!("duplicate icon {}", icon.name);
+        }
     }
 
     Ok(())

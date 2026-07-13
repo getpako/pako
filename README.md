@@ -69,8 +69,8 @@ The resulting binaries are `target/release/pako` and `target/release/pako-build`
 ### Offline `pako-build` smoke test
 
 `examples/hello-local` contains a tiny shell script packaged from the repository.
-It uses the `file:` source form, whose path is resolved relative to `recipe.toml`, so
-it neither downloads sources nor runs a build sandbox:
+It uses a local `path` source resolved relative to `recipe.toml`, so it neither
+downloads sources nor runs a build sandbox:
 
 ```bash
 cargo run -p pako-build -- build examples/hello-local/recipe.toml \
@@ -79,7 +79,8 @@ cargo run -p pako-build -- build examples/hello-local/recipe.toml \
 ```
 
 The resulting payload contains `bin/hello-pako`. Local source paths must remain
-inside the recipe directory and are checked against the declared size and SHA-256.
+inside the recipe directory. Their SHA-256 digest is calculated automatically while
+remote sources must provide an explicit checksum.
 
 ## License
 

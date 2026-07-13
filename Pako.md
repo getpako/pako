@@ -2110,41 +2110,32 @@ remain appropriate for generated OCI artifacts.
 ### 30.3. No update-discovery format
 
 Pako does not define release scrapers or provider-specific update logic. The `getpako/packages` repository may contain Python scripts that discover
-new upstream versions, update exact URLs, sizes, and checksums, and open pull
-requests. This automation is repository infrastructure, not a Pako client or
-recipe feature.
+new upstream versions, update exact URLs and checksums, and open pull requests.
+This automation is repository infrastructure, not a Pako client or recipe
+feature.
 
 `pako-build` always receives an exact recipe. It must not interpret `latest`,
 `current`, a floating branch, or an unpinned download as a release identity.
 
 ### 30.4. Target-specific sources
 
-Each architecture may define different sources:
+Each architecture may define a concise source table:
 
 ```toml
-[[targets]]
-target = "linux/x86_64"
+[source.x86_64]
+url = "https://example.org/app-linux-x86_64.tar.gz"
+sha256 = "..."
+strip = 1
 
-[[targets.sources]]
-id = "upstream"
-urls = ["https://example.org/app-linux-x86_64.tar.gz"]
-hash = "sha256:..."
-format = "tar.gz"
-strip_components = 1
-
-[[targets]]
-target = "linux/aarch64"
-
-[[targets.sources]]
-id = "upstream"
-urls = ["https://example.org/app-linux-aarch64.tar.gz"]
-hash = "sha256:..."
-format = "tar.gz"
-strip_components = 1
+[source.aarch64]
+url = "https://example.org/app-linux-aarch64.tar.gz"
+sha256 = "..."
+strip = 1
 ```
 
-This is the normal design for vendor applications such as IntelliJ IDEA and
-Android Studio. Only sources for the requested target are downloaded.
+The parser normalizes these keys to `linux/x86_64` and `linux/aarch64`. Archive
+formats are inferred from supported filename extensions. Only sources for the
+requested target are downloaded.
 
 ### 30.5. Prebuilt packages
 
@@ -2152,7 +2143,7 @@ A prebuilt recipe downloads already compiled upstream binaries. The builder:
 
 1. validates the recipe and target;
 2. downloads exact sources;
-3. verifies declared sizes and SHA-256 digests;
+3. verifies SHA-256 digests;
 4. safely extracts the archive;
 5. applies transformations;
 6. validates assertions and tests;
@@ -2160,48 +2151,27 @@ A prebuilt recipe downloads already compiled upstream binaries. The builder:
 8. performs FastCDC chunking and pack creation.
 
 It does not run an upstream installer merely because the archive contains one.
+Remote sources must declare SHA-256. Local recipe files are hashed automatically.
 
 ### 30.6. Source packages
 
 Source packages may execute shell scripts during the build. This is required for
 applications such as VSCodium and must be supported by schema `1`.
 
-Supported build phases:
-
-```text
-prepare -> configure -> build -> check -> install
-```
-
-Conceptual configuration:
+The normal configuration points to a separate script file:
 
 ```toml
-[targets.build]
-environment = "ghcr.io/getpako/build-images/linux-x86_64-v1@sha256:..."
-shell = "bash"
-network = false
-timeout_seconds = 7200
-
-[targets.build.scripts]
-configure = """
-cmake -S "$PAKO_SOURCE_DIR" -B "$PAKO_BUILD_DIR" -G Ninja \
-  -DCMAKE_INSTALL_PREFIX=/
-"""
-
-build = """
-cmake --build "$PAKO_BUILD_DIR" --parallel "$PAKO_JOBS"
-"""
-
-check = """
-ctest --test-dir "$PAKO_BUILD_DIR" --output-on-failure
-"""
-
-install = """
-DESTDIR="$PAKO_DESTDIR" cmake --install "$PAKO_BUILD_DIR"
-"""
+[build.x86_64]
+image = "ghcr.io/getpako/build-images/linux-x86_64-v1@sha256:..."
+script = "build.sh"
+timeout = 7200
 ```
 
-The `install` phase must place the final package tree only under
-`$PAKO_DESTDIR`.
+The script runs with Bash in the rootless build sandbox. It may perform all build
+steps itself, or the recipe may reference separate `prepare`, `configure`,
+`build`, `check`, and `install` script files under `[build.<arch>.steps]`.
+
+The script must place the final package tree only under `$PAKO_DESTDIR`.
 
 ### 30.7. Build sandbox
 

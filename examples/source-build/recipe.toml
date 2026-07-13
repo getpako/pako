@@ -1,46 +1,20 @@
 schema = 1
-
-[package]
 name = "example-editor"
 version = "1.0.0"
-release = 1
-
-[metadata]
 display_name = "Example Editor"
 summary = "Example source-built application"
-description = "A minimal example showing the source build phases."
+description = "A minimal example showing a sandboxed source build."
 vendor = "Example Project"
 homepage = "https://example.invalid/"
 license = "MIT"
+executables = ["bin/example-editor"]
 
-[[targets]]
-target = "linux/x86_64"
-[targets.build]
-environment = "ghcr.io/getpako/build-images/linux-x86_64-v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-network = false
-timeout_seconds = 3600
-[targets.build.scripts]
-configure = '''
-cmake -S "$PAKO_SOURCE_DIR" -B "$PAKO_BUILD_DIR" -G Ninja -DCMAKE_INSTALL_PREFIX=/
-'''
-build = '''
-cmake --build "$PAKO_BUILD_DIR" --parallel "$PAKO_JOBS"
-'''
-check = '''
-ctest --test-dir "$PAKO_BUILD_DIR" --output-on-failure
-'''
-install = '''
-DESTDIR="$PAKO_DESTDIR" cmake --install "$PAKO_BUILD_DIR"
-'''
-[[targets.sources]]
-id = "source"
-urls = ["https://example.invalid/example-editor-1.0.0.tar.gz"]
-hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-format = "tar.gz"
-strip_components = 1
+[source.x86_64]
+url = "https://example.invalid/example-editor-1.0.0.tar.gz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+strip = 1
 
-[[assertions]]
-type = "path"
-path = "bin/example-editor"
-kind = "file"
-executable = true
+[build.x86_64]
+image = "ghcr.io/getpako/build-images/linux-x86_64-v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+script = "build.sh"
+timeout = 3600
