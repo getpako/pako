@@ -1,0 +1,23 @@
+services:
+  registry:
+    image: registry:3
+    ports:
+      - "127.0.0.1:5000:5000"
+    environment:
+      OTEL_TRACES_EXPORTER: none
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+    volumes:
+      - registry-data:/var/lib/registry
+
+  tuf:
+    image: nginx:alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../.dev/tuf/metadata:/srv/tuf/metadata:ro
+      - ../.dev/tuf/targets:/srv/tuf/targets:ro
+
+volumes:
+  registry-data:
