@@ -13,15 +13,6 @@ vendor = "JetBrains"
 homepage = "https://www.jetbrains.com/idea/"
 license = "LicenseRef-JetBrains-IntelliJ-IDEA"
 
-[distribution]
-redistribution = "unknown"
-license_files = ["license"]
-
-[policies]
-payload_mutation = "deny"
-self_update = "external"
-user_data = "external"
-
 [[targets]]
 target = "linux/x86_64"
 [targets.build]
@@ -29,10 +20,8 @@ kind = "prebuilt"
 payload_source = "upstream"
 [[targets.sources]]
 id = "upstream"
-kind = "archive"
 urls = ["https://example.invalid/idea-linux-x86_64.tar.gz"]
-sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-size = 1
+hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 format = "tar.gz"
 strip_components = 1
 
@@ -43,10 +32,8 @@ kind = "prebuilt"
 payload_source = "upstream"
 [[targets.sources]]
 id = "upstream"
-kind = "archive"
 urls = ["https://example.invalid/idea-linux-aarch64.tar.gz"]
-sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-size = 1
+hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 format = "tar.gz"
 strip_components = 1
 

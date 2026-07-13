@@ -13,15 +13,6 @@ vendor = "Pako"
 homepage = "https://example.invalid/pako"
 license = "MIT"
 
-[distribution]
-redistribution = "allowed"
-license_files = []
-
-[policies]
-payload_mutation = "deny"
-self_update = "external"
-user_data = "external"
-
 [[targets]]
 target = "linux/x86_64"
 
@@ -30,9 +21,8 @@ kind = "prebuilt"
 
 [[targets.sources]]
 id = "hello-pako"
-kind = "file"
-urls = ["file:payload/hello-pako"]
-sha256 = "sha256:d046a7e56c4adfb3a8f25aff4e08af7276ab2ad106dffdf71d2c9dff657f380c"
+path = "payload/hello-pako"
+hash = "sha256:d046a7e56c4adfb3a8f25aff4e08af7276ab2ad106dffdf71d2c9dff657f380c"
 destination = "bin/hello-pako"
 
 [[transforms]]

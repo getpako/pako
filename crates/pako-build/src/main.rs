@@ -53,7 +53,7 @@ const BUILD_LONG_ABOUT: &str = "\
 Build one architecture-specific target from a Pako recipe.
 
 For a prebuilt target, the builder downloads the target-specific source,
-verifies its declared size and SHA-256 digest, safely extracts it, applies the
+verifies its declared digest, safely extracts it, applies the
 configured transforms, and validates the resulting payload.
 
 For a source target, the builder prepares pinned sources and executes declared

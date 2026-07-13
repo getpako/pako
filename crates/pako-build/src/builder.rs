@@ -97,29 +97,21 @@ impl Builder {
             self.download_source(source, recipe.recipe_dir(), &downloaded)
                 .await?;
 
-            match source.kind.as_str() {
-                "archive" => {
-                    let format = source
-                        .format
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("archive format is required"))?;
-                    archive::extract(
-                        &downloaded,
-                        format,
-                        &workspace.payload,
-                        source.strip_components,
-                    )?;
+            if let Some(format) = source.format.as_deref() {
+                archive::extract(
+                    &downloaded,
+                    format,
+                    &workspace.payload,
+                    source.strip_components,
+                )?;
+            } else {
+                let destination = source.destination.as_deref().unwrap_or(&source.id);
+                let destination =
+                    PackagePath::new(destination.to_owned())?.join_to(&workspace.payload);
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
                 }
-                "file" => {
-                    let destination = source.destination.as_deref().unwrap_or(&source.id);
-                    let destination =
-                        PackagePath::new(destination.to_owned())?.join_to(&workspace.payload);
-                    if let Some(parent) = destination.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::copy(&downloaded, destination)?;
-                }
-                other => anyhow::bail!("unsupported source kind {other}"),
+                std::fs::copy(&downloaded, destination)?;
             }
         }
 
@@ -218,9 +210,9 @@ impl Builder {
             entries,
             integrations: convert_integrations(recipe)?,
             policies: Policies {
-                payload_mutation: recipe.policies.payload_mutation.clone(),
-                self_update: recipe.policies.self_update.clone(),
-                user_data: recipe.policies.user_data.clone(),
+                payload_mutation: "deny".into(),
+                self_update: "external".into(),
+                user_data: "external".into(),
             },
         };
         manifest.validate()?;
@@ -258,17 +250,20 @@ impl Builder {
         recipe_directory: &Path,
         destination: &Path,
     ) -> anyhow::Result<()> {
-        let expected: Sha256Digest = source.sha256.parse()?;
+        let expected: Sha256Digest = source.hash.parse()?;
         let partial = destination.with_extension("partial");
 
+        if let Some(path) = &source.path {
+            self.copy_local_source(path, recipe_directory, expected, &partial)
+                .await?;
+            tokio::fs::rename(&partial, destination).await?;
+            return Ok(());
+        }
+
         for url in &source.urls {
-            let result = if let Some(path) = url.strip_prefix("file:") {
-                self.copy_local_source(path, recipe_directory, source.size, expected, &partial)
-                    .await
-            } else {
-                self.download_mirror(url, source.size, expected, &partial)
-                    .await
-            };
+            let result = self
+                .download_mirror(url, expected, &partial)
+                .await;
             match result {
                 Ok(()) => {
                     tokio::fs::rename(&partial, destination).await?;
@@ -288,7 +283,6 @@ impl Builder {
         &self,
         relative_path: &str,
         recipe_directory: &Path,
-        expected_size: Option<u64>,
         expected_digest: Sha256Digest,
         destination: &Path,
     ) -> anyhow::Result<()> {
@@ -296,13 +290,6 @@ impl Builder {
         let source = std::fs::canonicalize(recipe_directory.join(relative_path))?;
         if !source.starts_with(&recipe_directory) {
             anyhow::bail!("local source is outside the recipe directory");
-        }
-
-        let size = std::fs::metadata(&source)?.len();
-        if let Some(expected_size) = expected_size {
-            if size != expected_size {
-                anyhow::bail!("source size mismatch: expected {expected_size}, got {size}");
-            }
         }
 
         let (digest, _) = Sha256Digest::calculate_reader(std::fs::File::open(&source)?)?;
@@ -317,7 +304,6 @@ impl Builder {
     async fn download_mirror(
         &self,
         url: &str,
-        expected_size: Option<u64>,
         expected_digest: Sha256Digest,
         destination: &Path,
     ) -> anyhow::Result<()> {
@@ -325,24 +311,14 @@ impl Builder {
         let mut stream = response.bytes_stream();
         let mut output = tokio::fs::File::create(destination).await?;
         let mut hash = Sha256::new();
-        let mut size = 0_u64;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             output.write_all(&chunk).await?;
             hash.update(&chunk);
-            size = size
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| anyhow::anyhow!("source size overflow"))?;
         }
 
         output.sync_all().await?;
-
-        if let Some(expected_size) = expected_size {
-            if size != expected_size {
-                anyhow::bail!("source size mismatch: expected {expected_size}, got {size}");
-            }
-        }
 
         let actual = Sha256Digest::from_bytes(hash.finalize().into());
         if actual != expected_digest {

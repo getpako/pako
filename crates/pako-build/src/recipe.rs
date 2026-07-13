@@ -13,12 +13,6 @@ pub(crate) struct Recipe {
     pub schema: u32,
     pub package: Package,
     pub metadata: Metadata,
-    #[expect(
-        dead_code,
-        reason = "distribution metadata is preserved for recipe schema validation"
-    )]
-    pub distribution: Distribution,
-    pub policies: Policies,
     pub targets: Vec<Target>,
     #[serde(default)]
     pub transforms: Vec<Transform>,
@@ -47,30 +41,6 @@ pub(crate) struct Metadata {
     pub vendor: String,
     pub homepage: String,
     pub license: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Distribution {
-    #[expect(
-        dead_code,
-        reason = "distribution metadata is preserved for recipe schema validation"
-    )]
-    pub redistribution: String,
-    #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "distribution metadata is preserved for recipe schema validation"
-    )]
-    pub license_files: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Policies {
-    pub payload_mutation: String,
-    pub self_update: String,
-    pub user_data: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,11 +104,11 @@ impl Scripts {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Source {
     pub id: String,
-    pub kind: String,
-    pub urls: Vec<String>,
-    pub sha256: String,
     #[serde(default)]
-    pub size: Option<u64>,
+    pub path: Option<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    pub hash: String,
     #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]
@@ -318,24 +288,16 @@ fn validate_target(target: &Target) -> anyhow::Result<()> {
 
 fn validate_source(source: &Source) -> anyhow::Result<()> {
     validate_simple_identifier(&source.id, "source id")?;
-    source.sha256.parse::<Sha256Digest>()?;
+    source.hash.parse::<Sha256Digest>()?;
 
-    if source.urls.is_empty() {
-        anyhow::bail!("source URLs are required for {}", source.id);
+    if source.path.is_some() == source.urls.is_empty() {
+        anyhow::bail!("source {} must define exactly one of path or urls", source.id);
     }
 
-    match source.kind.as_str() {
-        "archive" => {
-            if source.format.is_none() {
-                anyhow::bail!("archive format is required for {}", source.id);
-            }
+    if source.format.is_none() {
+        if let Some(destination) = &source.destination {
+            PackagePath::new(destination.clone())?;
         }
-        "file" => {
-            if let Some(destination) = &source.destination {
-                PackagePath::new(destination.clone())?;
-            }
-        }
-        other => anyhow::bail!("unsupported source kind {other}"),
     }
 
     Ok(())
