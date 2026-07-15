@@ -262,8 +262,9 @@ impl Builder {
         }
 
         for url in &source.urls {
+            let source_name = source_filename(url, &source.id);
             let result = self
-                .download_mirror(&source.id, url, expected, &partial)
+                .download_mirror(&source_name, url, expected, &partial)
                 .await;
             match result {
                 Ok(()) => {
@@ -304,13 +305,13 @@ impl Builder {
 
     async fn download_mirror(
         &self,
-        source_id: &str,
+        source_name: &str,
         url: &str,
         expected_digest: Sha256Digest,
         destination: &Path,
     ) -> anyhow::Result<()> {
         let response = self.http.get(url).send().await?.error_for_status()?;
-        let progress = download_progress(source_id, response.content_length());
+        let progress = download_progress(source_name, response.content_length());
         let mut stream = response.bytes_stream();
         let mut output = tokio::fs::File::create(destination).await?;
         let mut hash = Sha256::new();
@@ -335,16 +336,27 @@ impl Builder {
         .await;
 
         match result {
-            Ok(()) => progress.finish_with_message(format!("downloaded source {source_id}")),
+            Ok(()) => progress.finish_with_message(format!("downloaded {source_name}")),
             Err(_) => {
-                progress.abandon_with_message(format!("download failed for source {source_id}"));
+                progress.abandon_with_message(format!("download failed for {source_name}"));
             }
         }
         result
     }
 }
 
-fn download_progress(source_id: &str, length: Option<u64>) -> ProgressBar {
+fn source_filename(url: &str, fallback: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()?
+                .rfind(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn download_progress(source_name: &str, length: Option<u64>) -> ProgressBar {
     let progress = match length {
         Some(length) => ProgressBar::new(length),
         None => ProgressBar::new_spinner(),
@@ -358,9 +370,30 @@ fn download_progress(source_id: &str, length: Option<u64>) -> ProgressBar {
     .expect("download progress templates are valid")
     .progress_chars("#>-");
     progress.set_style(style);
-    progress.set_message(format!("downloading source {source_id}"));
+    progress.set_message(format!("downloading {source_name}"));
     progress.enable_steady_tick(Duration::from_millis(100));
     progress
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_filename;
+
+    #[test]
+    fn derives_filename_from_source_url() {
+        assert_eq!(
+            source_filename(
+                "https://downloads.example.org/releases/tool-1.2.3.tar.gz?mirror=1",
+                "source"
+            ),
+            "tool-1.2.3.tar.gz"
+        );
+    }
+
+    #[test]
+    fn uses_source_id_when_url_has_no_filename() {
+        assert_eq!(source_filename("not a URL", "source"), "source");
+    }
 }
 
 #[derive(Debug)]
