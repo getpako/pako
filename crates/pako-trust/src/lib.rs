@@ -1,6 +1,6 @@
 //! TUF-backed mapping from package names to immutable OCI manifest digests.
 
-use std::{cmp::Ordering, path::PathBuf, str::FromStr};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
 
 use pako_core::{manifest::validate_package_name, Sha256Digest};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ pub struct ReleaseCatalog {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogPackage {
     pub name: String,
+    pub channels: BTreeMap<String, String>,
     pub releases: Vec<CatalogRelease>,
 }
 
@@ -48,6 +49,19 @@ impl ReleaseCatalog {
                     anyhow::bail!("unsupported target {} for {}", release.target, package.name);
                 }
             }
+            for (channel, release_id) in &package.channels {
+                if channel.is_empty()
+                    || !package
+                        .releases
+                        .iter()
+                        .any(|release| release.id() == *release_id)
+                {
+                    anyhow::bail!(
+                        "channel {channel} points to an unknown release for {}",
+                        package.name
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -67,14 +81,23 @@ impl ReleaseCatalog {
             .find(|package| package.name == package_name)
             .ok_or_else(|| anyhow::anyhow!("package not found: {package_name}"))?;
 
+        let release_id = package
+            .channels
+            .get(channel)
+            .ok_or_else(|| anyhow::anyhow!("no channel {channel} for {package_name}"))?;
         package
             .releases
             .iter()
-            .filter(|release| release.target == target && release.channel == channel)
-            .max_by(|left, right| compare_releases(left, right))
+            .find(|release| release.target == target && release.id() == *release_id)
             .ok_or_else(|| {
                 anyhow::anyhow!("no release for {package_name} on {target} in channel {channel}")
             })
+    }
+}
+
+impl CatalogRelease {
+    fn id(&self) -> String {
+        format!("{}-{}", self.upstream_version, self.release)
     }
 }
 
@@ -118,35 +141,5 @@ impl TrustedRepository {
         let catalog: ReleaseCatalog = serde_json::from_slice(&bytes)?;
         catalog.validate()?;
         Ok(catalog)
-    }
-}
-
-fn compare_releases(left: &CatalogRelease, right: &CatalogRelease) -> Ordering {
-    natural_compare(&left.upstream_version, &right.upstream_version)
-        .then(left.release.cmp(&right.release))
-}
-
-/// Compare common dotted or dashed version strings without requiring strict
-/// Semantic Versioning from upstream projects.
-fn natural_compare(left: &str, right: &str) -> Ordering {
-    let mut left_parts = left.split(|character: char| !character.is_ascii_alphanumeric());
-    let mut right_parts = right.split(|character: char| !character.is_ascii_alphanumeric());
-
-    loop {
-        match (left_parts.next(), right_parts.next()) {
-            (Some(left), Some(right)) => {
-                let ordering = match (left.parse::<u64>(), right.parse::<u64>()) {
-                    (Ok(left), Ok(right)) => left.cmp(&right),
-                    _ => left.cmp(right),
-                };
-
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            (Some(_), None) => return Ordering::Greater,
-            (None, Some(_)) => return Ordering::Less,
-            (None, None) => return Ordering::Equal,
-        }
     }
 }

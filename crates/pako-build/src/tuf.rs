@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     num::NonZeroU64,
     path::{Path, PathBuf},
 };
@@ -28,6 +28,7 @@ struct Catalog {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Package {
     name: String,
+    channels: BTreeMap<String, String>,
     releases: Vec<Release>,
 }
 
@@ -131,6 +132,7 @@ pub(crate) async fn add_release(
     } else {
         catalog.packages.push(Package {
             name: package_name,
+            channels: BTreeMap::new(),
             releases: Vec::new(),
         });
         catalog
@@ -144,7 +146,10 @@ pub(crate) async fn add_release(
             && item.upstream_version == release.upstream_version
             && item.number == release.number)
     });
+    let release_id = format!("{}-{}", release.upstream_version, release.number);
+    let channel = release.channel.clone();
     package.releases.push(release);
+    package.channels.insert(channel, release_id);
     catalog
         .packages
         .sort_by(|left, right| left.name.cmp(&right.name));
