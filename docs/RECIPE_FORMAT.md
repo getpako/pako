@@ -54,17 +54,18 @@ A target may contain several sources by using an array of tables:
 
 ```toml
 [[source.x86_64]]
-id = "application"
 url = "https://example.org/application.tar.gz"
 sha256 = "..."
 strip = 1
 
 [[source.x86_64]]
-id = "runtime"
 url = "https://example.org/runtime.tar.gz"
 sha256 = "..."
 strip = 1
 ```
+
+Sources have no separate ID. For non-archive sources without `to`, Pako uses the filename from
+the source URL or local path as the payload filename.
 
 ## Payload transformations
 

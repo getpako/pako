@@ -102,11 +102,9 @@ fn normalize_targets(
         let raw_sources = source
             .remove(&platform)
             .map_or_else(Vec::new, OneOrMany::into_vec);
-        let source_count = raw_sources.len();
         let sources = raw_sources
             .into_iter()
-            .enumerate()
-            .map(|(index, raw)| normalize_source(raw, index, source_count, directory))
+            .map(|raw| normalize_source(raw, directory))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let build = build
             .remove(&platform)
@@ -148,14 +146,8 @@ fn normalize_target_name(value: &str) -> anyhow::Result<String> {
     }
 }
 
-fn normalize_source(
-    raw: RawSource,
-    index: usize,
-    source_count: usize,
-    directory: &Path,
-) -> anyhow::Result<Source> {
+fn normalize_source(raw: RawSource, directory: &Path) -> anyhow::Result<Source> {
     let RawSource {
-        id,
         path,
         url,
         mirrors,
@@ -172,15 +164,6 @@ fn normalize_source(
         anyhow::bail!("a source must define path or url");
     }
 
-    let id = id.unwrap_or_else(|| {
-        if source_count == 1 {
-            "source".into()
-        } else {
-            let number = index + 1;
-            format!("source-{number}")
-        }
-    });
-
     let mut urls = Vec::new();
     if let Some(url) = url {
         urls.push(url);
@@ -194,10 +177,10 @@ fn normalize_source(
     });
 
     if format.is_some() && destination.is_some() {
-        anyhow::bail!("archive source {id} cannot define `to`");
+        anyhow::bail!("archive source cannot define `to`");
     }
     if format.is_none() && strip != 0 {
-        anyhow::bail!("non-archive source {id} cannot define `strip`");
+        anyhow::bail!("non-archive source cannot define `strip`");
     }
 
     let hash = if let Some(path) = &path {
@@ -208,12 +191,11 @@ fn normalize_source(
     } else {
         let value = sha256
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("remote source {id} must define sha256"))?;
+            .ok_or_else(|| anyhow::anyhow!("remote source must define sha256"))?;
         normalize_sha256(value)?
     };
 
     Ok(Source {
-        id,
         path,
         urls,
         hash,

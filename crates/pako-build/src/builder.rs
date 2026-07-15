@@ -93,8 +93,8 @@ impl Builder {
         target: &Target,
         workspace: &BuildWorkspace,
     ) -> anyhow::Result<()> {
-        for source in &target.sources {
-            let downloaded = workspace.sources.join(&source.id);
+        for (index, source) in target.sources.iter().enumerate() {
+            let downloaded = workspace.sources.join(format!("source-{}", index + 1));
             self.download_source(source, recipe.recipe_dir(), &downloaded)
                 .await?;
 
@@ -106,7 +106,8 @@ impl Builder {
                     source.strip_components,
                 )?;
             } else {
-                let destination = source.destination.as_deref().unwrap_or(&source.id);
+                let source_name = source_filename(source);
+                let destination = source.destination.as_deref().unwrap_or(&source_name);
                 let destination =
                     PackagePath::new(destination.to_owned())?.join_to(&workspace.payload);
                 if let Some(parent) = destination.parent() {
@@ -262,7 +263,7 @@ impl Builder {
         }
 
         for url in &source.urls {
-            let source_name = source_filename(url, &source.id);
+            let source_name = source_filename_from_url(url);
             let result = self
                 .download_mirror(&source_name, url, expected, &partial)
                 .await;
@@ -273,12 +274,12 @@ impl Builder {
                 }
                 Err(error) => {
                     let _ = tokio::fs::remove_file(&partial).await;
-                    eprintln!("source mirror failed for {}: {error:#}", source.id);
+                    eprintln!("source mirror failed for {source_name}: {error:#}");
                 }
             }
         }
 
-        anyhow::bail!("all source mirrors failed for {}", source.id)
+        anyhow::bail!("all source mirrors failed")
     }
 
     async fn copy_local_source(
@@ -345,7 +346,19 @@ impl Builder {
     }
 }
 
-fn source_filename(url: &str, fallback: &str) -> String {
+fn source_filename(source: &Source) -> String {
+    source.path.as_deref().map_or_else(
+        || source_filename_from_url(&source.urls[0]),
+        |path| {
+            Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map_or_else(|| "download".into(), ToOwned::to_owned)
+        },
+    )
+}
+
+fn source_filename_from_url(url: &str) -> String {
     url::Url::parse(url)
         .ok()
         .and_then(|url| {
@@ -353,7 +366,7 @@ fn source_filename(url: &str, fallback: &str) -> String {
                 .rfind(|segment| !segment.is_empty())
                 .map(ToOwned::to_owned)
         })
-        .unwrap_or_else(|| fallback.to_owned())
+        .unwrap_or_else(|| "download".into())
 }
 
 fn download_progress(source_name: &str, length: Option<u64>) -> ProgressBar {
@@ -377,22 +390,21 @@ fn download_progress(source_name: &str, length: Option<u64>) -> ProgressBar {
 
 #[cfg(test)]
 mod tests {
-    use super::source_filename;
+    use super::source_filename_from_url;
 
     #[test]
     fn derives_filename_from_source_url() {
         assert_eq!(
-            source_filename(
-                "https://downloads.example.org/releases/tool-1.2.3.tar.gz?mirror=1",
-                "source"
+            source_filename_from_url(
+                "https://downloads.example.org/releases/tool-1.2.3.tar.gz?mirror=1"
             ),
             "tool-1.2.3.tar.gz"
         );
     }
 
     #[test]
-    fn uses_source_id_when_url_has_no_filename() {
-        assert_eq!(source_filename("not a URL", "source"), "source");
+    fn uses_generic_name_when_url_has_no_filename() {
+        assert_eq!(source_filename_from_url("not a URL"), "download");
     }
 }
 

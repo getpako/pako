@@ -106,6 +106,29 @@ url = "https://example.invalid/editor.zip"
 }
 
 #[test]
+fn rejects_source_ids() {
+    let fixture = TempDir::new().unwrap();
+    fs::write(
+        fixture.path().join("recipe.toml"),
+        r#"
+schema = 1
+name = "editor"
+version = "2.0.0"
+summary = "Editor"
+license = "MIT"
+
+[source.x86_64]
+id = "editor"
+url = "https://example.invalid/editor.zip"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+"#,
+    )
+    .unwrap();
+
+    assert!(load(&fixture.path().join("recipe.toml")).is_err());
+}
+
+#[test]
 fn rejects_unknown_fields() {
     let fixture = TempDir::new().unwrap();
     fs::write(

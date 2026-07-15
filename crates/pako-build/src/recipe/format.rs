@@ -81,8 +81,6 @@ impl<T> OneOrMany<T> {
 #[serde(deny_unknown_fields)]
 struct RawSource {
     #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
     path: Option<String>,
     #[serde(default)]
     url: Option<String>,

@@ -103,7 +103,6 @@ impl Scripts {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Source {
-    pub id: String,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
@@ -273,19 +272,14 @@ fn validate_target(target: &Target) -> anyhow::Result<()> {
         }
     }
 
-    let mut source_ids = BTreeSet::new();
     for source in &target.sources {
         validate_source(source)?;
-        if !source_ids.insert(source.id.as_str()) {
-            anyhow::bail!("duplicate source id {}", source.id);
-        }
     }
 
     Ok(())
 }
 
 fn validate_source(source: &Source) -> anyhow::Result<()> {
-    validate_simple_identifier(&source.id, "source id")?;
     source.hash.parse::<Sha256Digest>()?;
 
     if let Some(format) = source.format.as_deref() {
@@ -293,20 +287,14 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
             anyhow::bail!("unsupported archive format {format}");
         }
         if source.destination.is_some() {
-            anyhow::bail!("archive source {} cannot define a destination", source.id);
+            anyhow::bail!("archive source cannot define a destination");
         }
     } else if source.strip_components != 0 {
-        anyhow::bail!(
-            "non-archive source {} cannot strip path components",
-            source.id
-        );
+        anyhow::bail!("non-archive source cannot strip path components");
     }
 
     if source.path.is_some() != source.urls.is_empty() {
-        anyhow::bail!(
-            "source {} must define exactly one of path or urls",
-            source.id
-        );
+        anyhow::bail!("source must define exactly one of path or urls");
     }
 
     if source.format.is_none() {
