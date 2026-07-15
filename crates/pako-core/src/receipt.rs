@@ -7,11 +7,10 @@ use crate::{
     canonical, error::IoContext, manifest::validate_package_name, Error, Result, Sha256Digest,
 };
 
-/// Durable record of the active package release and files exposed outside the
-/// managed cellar.
+/// Immutable provenance for one installed version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Receipt {
+pub struct InstalledVersionRecord {
     pub schema: u32,
     pub package: String,
     pub upstream_version: String,
@@ -22,10 +21,23 @@ pub struct Receipt {
     pub package_manifest_digest: Sha256Digest,
     pub pack_index_digest: Sha256Digest,
     pub tree_digest: Sha256Digest,
-    pub active_path: String,
     pub installed_at: String,
-    pub previous_versions: Vec<String>,
     pub exposures: Vec<ExposureReceipt>,
+}
+
+/// Compatibility name for internal transaction code.
+pub type Receipt = InstalledVersionRecord;
+
+/// Mutable package-level state. The active path is always derived from this
+/// version name and the layout, never trusted from persisted absolute paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageState {
+    pub schema: u32,
+    pub package: String,
+    pub active: String,
+    pub history: Vec<String>,
+    pub channel: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +48,7 @@ pub struct ExposureReceipt {
     pub digest: Sha256Digest,
 }
 
-impl Receipt {
+impl InstalledVersionRecord {
     pub fn validate(&self) -> Result<()> {
         if self.schema != 1 {
             return Err(Error::UnsupportedSchema(self.schema));
@@ -80,6 +92,43 @@ impl Receipt {
 
         sync_directory(parent)
     }
+}
+
+impl PackageState {
+    pub fn load(path: &Path) -> Result<Self> {
+        let file = File::open(path).at(path)?;
+        let state: Self = serde_json::from_reader(file)?;
+        if state.schema != 1 {
+            return Err(Error::UnsupportedSchema(state.schema));
+        }
+        validate_package_name(&state.package)?;
+        Ok(state)
+    }
+
+    pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        if self.schema != 1 {
+            return Err(Error::UnsupportedSchema(self.schema));
+        }
+        validate_package_name(&self.package)?;
+        save_atomic(self, path)
+    }
+}
+
+fn save_atomic(value: &impl Serialize, path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state path has no parent"))?;
+    std::fs::create_dir_all(parent).at(parent)?;
+    let mut temporary = NamedTempFile::new_in(parent).at(parent)?;
+    temporary
+        .write_all(&canonical::to_vec(value)?)
+        .at(temporary.path())?;
+    temporary.as_file().sync_all().at(temporary.path())?;
+    temporary.persist(path).map_err(|error| Error::Io {
+        path: path.to_owned(),
+        source: error.error,
+    })?;
+    sync_directory(parent)
 }
 
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {

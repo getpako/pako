@@ -89,8 +89,12 @@ impl Layout {
         self.cache.join("packs")
     }
 
-    pub fn receipts(&self) -> PathBuf {
-        self.state.join("receipts")
+    pub fn packages(&self) -> PathBuf {
+        self.state.join("packages")
+    }
+
+    pub fn versions(&self) -> PathBuf {
+        self.state.join("versions")
     }
 
     pub fn transactions(&self) -> PathBuf {
@@ -111,8 +115,16 @@ impl Layout {
         Ok(self.apps().join(package).join("current"))
     }
 
-    pub fn receipt(&self, package: &str) -> Result<PathBuf> {
+    pub fn package_state(&self, package: &str) -> Result<PathBuf> {
         validate_package_name(package)?;
-        Ok(self.receipts().join(format!("{package}.json")))
+        Ok(self.packages().join(format!("{package}.json")))
+    }
+
+    pub fn version_record(&self, package: &str, version: &str) -> Result<PathBuf> {
+        validate_package_name(package)?;
+        Ok(self
+            .versions()
+            .join(package)
+            .join(format!("{version}.json")))
     }
 }

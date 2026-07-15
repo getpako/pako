@@ -11,7 +11,7 @@ use crate::{
     error::IoContext,
     integrations::{self, PreparedExposure},
     layout::Layout,
-    receipt::{sync_directory, Receipt},
+    receipt::{sync_directory, PackageState, Receipt},
     Error, Result,
 };
 
@@ -43,6 +43,7 @@ pub enum RecoveryAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommitPlan {
     pub receipt: Receipt,
+    pub state: PackageState,
     pub exposures: Vec<PreparedExposure>,
 }
 
@@ -185,7 +186,7 @@ fn validate_journal(layout: &Layout, journal: &Journal) -> Result<()> {
                 "journal receipt has another package".into(),
             ));
         }
-        if Path::new(&commit.receipt.active_path) != final_path {
+        if final_path.file_name().and_then(|value| value.to_str()) != Some(&commit.state.active) {
             return Err(Error::Transaction(
                 "journal receipt has another active path".into(),
             ));
@@ -292,7 +293,10 @@ fn recover_roll_forward(
     integrations::ExposureTransaction::recover_commit(layout, &commit.exposures)?;
     commit
         .receipt
-        .save_atomic(&layout.receipt(&journal.package)?)
+        .save_atomic(&layout.version_record(&journal.package, &commit.state.active)?)?;
+    commit
+        .state
+        .save_atomic(&layout.package_state(&journal.package)?)
 }
 
 /// Atomically replace the active-version symlink.
@@ -387,9 +391,7 @@ mod tests {
             package_manifest_digest: digest,
             pack_index_digest: digest,
             tree_digest: digest,
-            active_path: new.display().to_string(),
             installed_at: "0".into(),
-            previous_versions: vec!["1.0-1".into()],
             exposures: vec![ExposureReceipt {
                 kind: "launcher".into(),
                 path: path.display().to_string(),
@@ -398,6 +400,13 @@ mod tests {
         };
         journal.commit = Some(CommitPlan {
             receipt,
+            state: PackageState {
+                schema: 1,
+                package: "demo".into(),
+                active: "2.0-1".into(),
+                history: vec!["2.0-1".into(), "1.0-1".into()],
+                channel: "stable".into(),
+            },
             exposures: vec![PreparedExposure {
                 temporary: temporary.display().to_string(),
                 receipt: ExposureReceipt {
@@ -417,7 +426,7 @@ mod tests {
             new
         );
         assert_eq!(
-            Receipt::load(&layout.receipt("demo").unwrap())
+            Receipt::load(&layout.version_record("demo", "2.0-1").unwrap())
                 .unwrap()
                 .package,
             "demo"

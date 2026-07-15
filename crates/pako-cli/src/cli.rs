@@ -248,6 +248,20 @@ pub(crate) enum Command {
     )]
     Rollback(RollbackArgs),
 
+    /// List retained versions of one package.
+    #[command(
+        long_about = "List every retained local version, with the active version first.",
+        after_help = "Examples:\n  pako versions intellij-idea"
+    )]
+    Versions(VersionsArgs),
+
+    /// Remove older retained versions.
+    #[command(
+        long_about = "Remove retained versions after the requested keep count. The active version is always retained.",
+        after_help = "Examples:\n  pako prune intellij-idea --keep 2"
+    )]
+    Prune(PruneArgs),
+
     /// Remove a package and all of its retained versions.
     #[command(
         long_about = REMOVE_LONG_ABOUT,
@@ -324,6 +338,23 @@ pub(crate) struct RollbackArgs {
     /// in the package receipt.
     #[arg(long, value_name = "VERSION")]
     pub(crate) to: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct VersionsArgs {
+    /// Package whose retained versions should be listed.
+    #[arg(value_name = "PACKAGE")]
+    pub(crate) package: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PruneArgs {
+    /// Package whose older versions should be removed.
+    #[arg(value_name = "PACKAGE")]
+    pub(crate) package: String,
+    /// Number of most recent history entries to retain.
+    #[arg(long, value_name = "COUNT")]
+    pub(crate) keep: usize,
 }
 
 /// Arguments accepted by `pako remove`.

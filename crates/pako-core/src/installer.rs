@@ -12,7 +12,7 @@ use crate::{
     manifest::{PackIndex, PackageManifest},
     materialize,
     object_store::ObjectStore,
-    receipt::Receipt,
+    receipt::{PackageState, Receipt},
     transaction::{activate_symlink, CommitPlan, Journal, PackageLock, Phase, RecoveryAction},
     verify, Result, Sha256Digest,
 };
@@ -23,6 +23,7 @@ pub struct InstallRequest {
     pub oci_manifest_digest: Sha256Digest,
     pub package_manifest_digest: Sha256Digest,
     pub pack_index_digest: Sha256Digest,
+    pub channel: String,
 }
 
 /// Coordinates package installation and lifecycle operations.
@@ -103,14 +104,23 @@ impl Installer {
             package_manifest_digest: request.package_manifest_digest,
             pack_index_digest: request.pack_index_digest,
             tree_digest: manifest.tree_digest,
-            active_path: final_path.display().to_string(),
             installed_at: now_seconds().to_string(),
-            previous_versions: old_current
-                .iter()
-                .filter_map(|path| path.file_name())
-                .map(|value| value.to_string_lossy().into_owned())
-                .collect(),
             exposures: Vec::new(),
+        };
+
+        let previous = PackageState::load(&self.layout.package_state(&manifest.package)?).ok();
+        let mut history = previous
+            .as_ref()
+            .map(|state| state.history.clone())
+            .unwrap_or_default();
+        history.retain(|entry| entry != &version);
+        history.insert(0, version.clone());
+        let state = PackageState {
+            schema: 1,
+            package: manifest.package.clone(),
+            active: version.clone(),
+            history,
+            channel: request.channel.clone(),
         };
 
         let mut exposures = integrations::ExposureTransaction::begin(&self.layout, &journal.id)?;
@@ -123,6 +133,7 @@ impl Installer {
             .collect();
         journal.commit = Some(CommitPlan {
             receipt: receipt.clone(),
+            state,
             exposures: prepared,
         });
         journal.save(&self.layout)?;
@@ -137,7 +148,13 @@ impl Installer {
 
         activate_symlink(&final_path, &current_link)?;
         exposures.commit()?;
-        receipt.save_atomic(&self.layout.receipt(&manifest.package)?)?;
+        receipt.save_atomic(&self.layout.version_record(&manifest.package, &version)?)?;
+        journal
+            .commit
+            .as_ref()
+            .expect("commit plan exists")
+            .state
+            .save_atomic(&self.layout.package_state(&manifest.package)?)?;
 
         journal.advance(&self.layout, Phase::Complete)?;
         journal.remove(&self.layout)?;
@@ -146,19 +163,25 @@ impl Installer {
     }
 
     pub fn verify(&self, package: &str) -> Result<verify::VerificationReport> {
-        let receipt = Receipt::load(&self.layout.receipt(package)?)?;
-        let version = format!("{}-{}", receipt.upstream_version, receipt.release);
+        let state = PackageState::load(&self.layout.package_state(package)?)?;
+        let version = state.active;
         let manifest = self.load_manifest(package, &version)?;
-        verify::verify_tree(&manifest, Path::new(&receipt.active_path))
+        verify::verify_tree(&manifest, &self.layout.package_version(package, &version)?)
     }
 
     pub fn rollback(&self, package: &str, requested: Option<&str>) -> Result<String> {
         let _lock = PackageLock::acquire(&self.layout, package)?;
-        let mut receipt = Receipt::load(&self.layout.receipt(package)?)?;
+        let mut state = PackageState::load(&self.layout.package_state(package)?)?;
 
         let target_version = requested
             .map(ToOwned::to_owned)
-            .or_else(|| receipt.previous_versions.last().cloned())
+            .or_else(|| {
+                state
+                    .history
+                    .iter()
+                    .find(|version| *version != &state.active)
+                    .cloned()
+            })
             .ok_or_else(|| anyhow::anyhow!("no rollback version available"))?;
         let target_path = self.layout.package_version(package, &target_version)?;
 
@@ -170,25 +193,40 @@ impl Installer {
         verify::verify_tree(&manifest, &target_path)?;
         activate_symlink(&target_path, &self.layout.current_link(package)?)?;
 
-        let current_version = format!("{}-{}", receipt.upstream_version, receipt.release);
-        if current_version != target_version {
-            receipt.previous_versions.push(current_version);
-        }
-
-        let (upstream_version, release) = split_version(&target_version)?;
-        receipt.upstream_version = upstream_version;
-        receipt.release = release;
-        receipt.active_path = target_path.display().to_string();
-        receipt.tree_digest = manifest.tree_digest;
-        receipt.save_atomic(&self.layout.receipt(package)?)?;
+        state.history.retain(|version| version != &target_version);
+        state.history.insert(0, target_version.clone());
+        state.active.clone_from(&target_version);
+        state.save_atomic(&self.layout.package_state(package)?)?;
 
         Ok(target_version)
     }
 
+    pub fn versions(&self, package: &str) -> Result<PackageState> {
+        PackageState::load(&self.layout.package_state(package)?)
+    }
+
+    pub fn prune(&self, package: &str, keep: usize) -> Result<Vec<String>> {
+        let _lock = PackageLock::acquire(&self.layout, package)?;
+        let mut state = PackageState::load(&self.layout.package_state(package)?)?;
+        let keep = keep.max(1);
+        let removed = state.history.split_off(keep);
+        for version in &removed {
+            remove_directory_if_present(&self.layout.package_version(package, version)?)?;
+            let record = self.layout.version_record(package, version)?;
+            if record.exists() {
+                std::fs::remove_file(&record).at(&record)?;
+            }
+            remove_directory_if_present(&self.layout.manifests().join(package).join(version))?;
+        }
+        state.save_atomic(&self.layout.package_state(package)?)?;
+        Ok(removed)
+    }
+
     pub fn remove(&self, package: &str) -> Result<()> {
         let _lock = PackageLock::acquire(&self.layout, package)?;
-        let receipt_path = self.layout.receipt(package)?;
-        let receipt = Receipt::load(&receipt_path)?;
+        let state_path = self.layout.package_state(package)?;
+        let state = PackageState::load(&state_path)?;
+        let receipt = Receipt::load(&self.layout.version_record(package, &state.active)?)?;
 
         let _exposures =
             integrations::ExposureTransaction::begin(&self.layout, format!("remove-{package}"))?;
@@ -196,7 +234,8 @@ impl Installer {
         remove_symlink_if_present(&self.layout.current_link(package)?)?;
         remove_directory_if_present(&self.layout.cellar().join(package))?;
         remove_directory_if_present(&self.layout.manifests().join(package))?;
-        std::fs::remove_file(&receipt_path).at(&receipt_path)?;
+        remove_directory_if_present(&self.layout.versions().join(package))?;
+        std::fs::remove_file(&state_path).at(&state_path)?;
         Ok(())
     }
 
@@ -292,14 +331,6 @@ fn remove_directory_if_present(path: &Path) -> Result<()> {
         std::fs::remove_dir_all(path).at(path)?;
     }
     Ok(())
-}
-
-fn split_version(value: &str) -> Result<(String, u32)> {
-    let (upstream, release) = value
-        .rsplit_once('-')
-        .ok_or_else(|| anyhow::anyhow!("invalid package version: {value}"))?;
-    let release = release.parse().map_err(anyhow::Error::from)?;
-    Ok((upstream.to_owned(), release))
 }
 
 fn now_seconds() -> u64 {

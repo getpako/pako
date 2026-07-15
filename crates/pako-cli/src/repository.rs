@@ -95,6 +95,7 @@ pub(crate) async fn install_remote(
         oci_manifest_digest: platform.digest,
         package_manifest_digest: package_descriptor.digest,
         pack_index_digest: index_descriptor.digest,
+        channel: channel.to_owned(),
     };
     let receipt = installer.install(&package_manifest, &pack_index, &request)?;
 

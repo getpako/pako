@@ -1,4 +1,8 @@
-use pako_core::{installer::Installer, layout::Layout, receipt::Receipt};
+use pako_core::{
+    installer::Installer,
+    layout::Layout,
+    receipt::{PackageState, Receipt},
+};
 
 use crate::{
     cli::{Cli, Command},
@@ -44,6 +48,17 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
             });
             output.print(&json, format!("rolled back {package} to {version}"))?;
         }
+        Command::Versions(arguments) => {
+            let state = installer.versions(&arguments.package)?;
+            output.print(&serde_json::to_value(&state)?, state.history.join("\n"))?;
+        }
+        Command::Prune(arguments) => {
+            let removed = installer.prune(&arguments.package, arguments.keep)?;
+            output.print(
+                &serde_json::json!({"package": arguments.package, "removed": removed}),
+                "pruned retained versions",
+            )?;
+        }
         Command::Remove(arguments) => {
             let package = arguments.package;
             if !cli.yes && !confirm(&format!("Remove {package}?"))? {
@@ -74,23 +89,27 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
 
 fn list_receipts(output: Output, layout: &Layout) -> anyhow::Result<()> {
     let mut receipts = Vec::new();
-    let directory = layout.receipts();
+    let directory = layout.packages();
 
     if directory.exists() {
         for entry in std::fs::read_dir(directory)? {
             let path = entry?.path();
             if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                receipts.push(Receipt::load(&path)?);
+                let state = PackageState::load(&path)?;
+                receipts.push((
+                    state.clone(),
+                    Receipt::load(&layout.version_record(&state.package, &state.active)?)?,
+                ));
             }
         }
     }
 
-    receipts.sort_by(|left, right| left.package.cmp(&right.package));
+    receipts.sort_by(|left, right| left.0.package.cmp(&right.0.package));
 
     if output.is_json() {
         println!("{}", serde_json::to_string_pretty(&receipts)?);
     } else {
-        for receipt in receipts {
+        for (_, receipt) in receipts {
             println!(
                 "{}\t{}-{}\t{}",
                 receipt.package, receipt.upstream_version, receipt.release, receipt.target,
@@ -106,8 +125,9 @@ fn status(output: Output, layout: &Layout, package: Option<&str>) -> anyhow::Res
         return list_receipts(output, layout);
     };
 
-    let receipt = Receipt::load(&layout.receipt(package)?)?;
-    let json = serde_json::to_value(&receipt)?;
+    let state = PackageState::load(&layout.package_state(package)?)?;
+    let receipt = Receipt::load(&layout.version_record(package, &state.active)?)?;
+    let json = serde_json::json!({ "state": state, "version": receipt });
     output.print(
         &json,
         format!(
