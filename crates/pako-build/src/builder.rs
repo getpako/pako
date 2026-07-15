@@ -414,6 +414,7 @@ fn download_progress(source_name: &str, length: Option<u64>) -> ProgressBar {
 
 #[cfg(test)]
 mod tests {
+    use indicatif::ProgressBar;
     use tempfile::TempDir;
 
     use super::{compress_packs, scan_tree, source_filename_from_url, PlannedPack};
@@ -447,6 +448,7 @@ mod tests {
         std::fs::write(chunks.join(first.hex()), b"first chunk").unwrap();
         std::fs::write(chunks.join(second.hex()), b"second chunk").unwrap();
 
+        let progress = ProgressBar::hidden();
         let completed = compress_packs(
             vec![
                 PlannedPack {
@@ -461,6 +463,7 @@ mod tests {
             &chunks,
             &packs,
             2,
+            &progress,
         )
         .unwrap();
 
@@ -733,7 +736,25 @@ fn build_packs(
         "compressing {} packs with {worker_count} worker(s)",
         planned.len()
     );
-    let completed = compress_packs(planned, chunks_directory, packs_directory, worker_count)?;
+    let pack_count = planned.len();
+    let progress = pack_progress(pack_count);
+    let compressed = compress_packs(
+        planned,
+        chunks_directory,
+        packs_directory,
+        worker_count,
+        &progress,
+    );
+    let completed = match compressed {
+        Ok(completed) => {
+            progress.finish_with_message(format!("compressed {pack_count} packs"));
+            completed
+        }
+        Err(error) => {
+            progress.abandon_with_message("pack compression failed");
+            return Err(error);
+        }
+    };
 
     let mut packs = BTreeMap::new();
     let mut locations = BTreeMap::new();
@@ -811,6 +832,7 @@ fn compress_packs(
     chunks_directory: &Path,
     packs_directory: &Path,
     worker_count: usize,
+    progress: &ProgressBar,
 ) -> anyhow::Result<Vec<CompletedPack>> {
     let queue = Mutex::new(VecDeque::from(planned));
     let results = Mutex::new(Vec::new());
@@ -822,6 +844,7 @@ fn compress_packs(
                     return;
                 };
                 let result = compress_pack(pack, chunks_directory, packs_directory);
+                progress.inc(1);
                 results
                     .lock()
                     .expect("pack result lock poisoned")
@@ -835,6 +858,19 @@ fn compress_packs(
         .expect("pack result lock poisoned")
         .into_iter()
         .collect()
+}
+
+fn pack_progress(pack_count: usize) -> ProgressBar {
+    let progress = ProgressBar::new(pack_count as u64);
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} packs ({per_sec})",
+    )
+    .expect("pack compression progress template is valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.set_message("compressing packs");
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
 }
 
 fn compress_pack(
