@@ -8,6 +8,7 @@ use std::{
 };
 
 use futures_util::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use pako_core::{
     canonical,
     chunking::{Chunker, PakoFastCdcV1},
@@ -261,7 +262,9 @@ impl Builder {
         }
 
         for url in &source.urls {
-            let result = self.download_mirror(url, expected, &partial).await;
+            let result = self
+                .download_mirror(&source.id, url, expected, &partial)
+                .await;
             match result {
                 Ok(()) => {
                     tokio::fs::rename(&partial, destination).await?;
@@ -301,30 +304,63 @@ impl Builder {
 
     async fn download_mirror(
         &self,
+        source_id: &str,
         url: &str,
         expected_digest: Sha256Digest,
         destination: &Path,
     ) -> anyhow::Result<()> {
         let response = self.http.get(url).send().await?.error_for_status()?;
+        let progress = download_progress(source_id, response.content_length());
         let mut stream = response.bytes_stream();
         let mut output = tokio::fs::File::create(destination).await?;
         let mut hash = Sha256::new();
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            output.write_all(&chunk).await?;
-            hash.update(&chunk);
+        let result = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                output.write_all(&chunk).await?;
+                hash.update(&chunk);
+                progress.inc(chunk.len() as u64);
+            }
+
+            output.sync_all().await?;
+
+            let actual = Sha256Digest::from_bytes(hash.finalize().into());
+            if actual != expected_digest {
+                anyhow::bail!("source digest mismatch: expected {expected_digest}, got {actual}");
+            }
+
+            Ok(())
         }
+        .await;
 
-        output.sync_all().await?;
-
-        let actual = Sha256Digest::from_bytes(hash.finalize().into());
-        if actual != expected_digest {
-            anyhow::bail!("source digest mismatch: expected {expected_digest}, got {actual}");
+        match result {
+            Ok(()) => progress.finish_with_message(format!("downloaded source {source_id}")),
+            Err(_) => {
+                progress.abandon_with_message(format!("download failed for source {source_id}"));
+            }
         }
-
-        Ok(())
+        result
     }
+}
+
+fn download_progress(source_id: &str, length: Option<u64>) -> ProgressBar {
+    let progress = match length {
+        Some(length) => ProgressBar::new(length),
+        None => ProgressBar::new_spinner(),
+    };
+    let style = match length {
+        Some(_) => ProgressStyle::with_template(
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+        ),
+        None => ProgressStyle::with_template("{spinner:.green} {msg} {bytes} ({bytes_per_sec})"),
+    }
+    .expect("download progress templates are valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.set_message(format!("downloading source {source_id}"));
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
 }
 
 #[derive(Debug)]

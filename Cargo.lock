@@ -1157,6 +1157,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "indicatif",
  "jiff",
  "pako-core",
  "pako-oci",
