@@ -1,9 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -48,17 +49,18 @@ pub(crate) struct BuildReport {
 pub(crate) struct Builder {
     output: PathBuf,
     http: reqwest::Client,
+    jobs: usize,
 }
 
 impl Builder {
-    pub(crate) fn new(output: PathBuf) -> anyhow::Result<Self> {
+    pub(crate) fn new(output: PathBuf, jobs: usize) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_hours(1))
             .user_agent(concat!("pako-build/", env!("CARGO_PKG_VERSION")))
             .build()?;
 
-        Ok(Self { output, http })
+        Ok(Self { output, http, jobs })
     }
 
     pub(crate) async fn build(
@@ -149,7 +151,7 @@ impl Builder {
             network: target.build.network,
             timeout: Duration::from_secs(target.build.timeout_seconds.unwrap_or(3600)),
         };
-        let environment = build_environment(target);
+        let environment = build_environment(target, self.jobs);
 
         for (phase, script) in target.build.scripts.phases() {
             let Some(script) = script else {
@@ -244,6 +246,7 @@ impl Builder {
             &chunks_directory,
             &output.join("packs"),
             manifest_digest,
+            self.jobs,
         )?;
         index.validate_against(&manifest)?;
 
@@ -411,7 +414,10 @@ fn download_progress(source_name: &str, length: Option<u64>) -> ProgressBar {
 
 #[cfg(test)]
 mod tests {
-    use super::source_filename_from_url;
+    use tempfile::TempDir;
+
+    use super::{compress_packs, source_filename_from_url, PlannedPack};
+    use pako_core::{pack::PackReader, Sha256Digest};
 
     #[test]
     fn derives_filename_from_source_url() {
@@ -426,6 +432,42 @@ mod tests {
     #[test]
     fn uses_generic_name_when_url_has_no_filename() {
         assert_eq!(source_filename_from_url("not a URL"), "download");
+    }
+
+    #[test]
+    fn compresses_separate_packs_in_parallel() {
+        let temporary = TempDir::new().unwrap();
+        let chunks = temporary.path().join("chunks");
+        let packs = temporary.path().join("packs");
+        std::fs::create_dir_all(&chunks).unwrap();
+        std::fs::create_dir_all(&packs).unwrap();
+
+        let first = Sha256Digest::calculate(b"first chunk");
+        let second = Sha256Digest::calculate(b"second chunk");
+        std::fs::write(chunks.join(first.hex()), b"first chunk").unwrap();
+        std::fs::write(chunks.join(second.hex()), b"second chunk").unwrap();
+
+        let completed = compress_packs(
+            vec![
+                PlannedPack {
+                    ordinal: 0,
+                    chunks: vec![first],
+                },
+                PlannedPack {
+                    ordinal: 1,
+                    chunks: vec![second],
+                },
+            ],
+            &chunks,
+            &packs,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(completed.len(), 2);
+        for pack in completed {
+            PackReader::open(&packs.join(format!("{}.pakopack", pack.digest.hex()))).unwrap();
+        }
     }
 }
 
@@ -460,19 +502,14 @@ impl BuildWorkspace {
     }
 }
 
-fn build_environment(target: &Target) -> BTreeMap<String, String> {
+fn build_environment(target: &Target, jobs: usize) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("PAKO_RECIPE_DIR".into(), "/pako/recipe".into()),
         ("PAKO_SOURCE_DIR".into(), "/pako/source".into()),
         ("PAKO_BUILD_DIR".into(), "/pako/build".into()),
         ("PAKO_DESTDIR".into(), "/pako/dest".into()),
         ("PAKO_TARGET".into(), target.platform.clone()),
-        (
-            "PAKO_JOBS".into(),
-            std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .to_string(),
-        ),
+        ("PAKO_JOBS".into(), jobs.to_string()),
         ("HOME".into(), "/tmp/home".into()),
         ("SOURCE_DATE_EPOCH".into(), "0".into()),
     ])
@@ -577,6 +614,7 @@ fn build_packs(
     chunks_directory: &Path,
     packs_directory: &Path,
     manifest_digest: Sha256Digest,
+    jobs: usize,
 ) -> anyhow::Result<PackIndex> {
     std::fs::create_dir_all(packs_directory)?;
 
@@ -591,25 +629,30 @@ fn build_packs(
         .map(|chunk| chunk.digest)
         .collect();
 
+    let planned = plan_packs(required, chunks_directory)?;
+    let worker_count = jobs.max(1).min(planned.len().max(1));
+    info!(
+        "compressing {} packs with {worker_count} worker(s)",
+        planned.len()
+    );
+    let completed = compress_packs(planned, chunks_directory, packs_directory, worker_count)?;
+
     let mut packs = BTreeMap::new();
     let mut locations = BTreeMap::new();
-    let mut writer = PackWriter::new();
-
-    for digest in required {
-        let bytes = std::fs::read(chunks_directory.join(digest.hex()))?;
-        let would_exceed_soft_limit = writer.estimated_stored_size() > 0
-            && writer.estimated_stored_size() + bytes.len() as u64 > SOFT_PACK_LIMIT;
-
-        if would_exceed_soft_limit {
-            flush_pack(writer, packs_directory, &mut packs, &mut locations)?;
-            writer = PackWriter::new();
+    for pack in completed {
+        packs.insert(pack.digest, PackDescriptor { size: pack.size });
+        for entry in pack.entries {
+            locations.insert(
+                entry.digest,
+                ChunkLocation {
+                    pack: pack.digest,
+                    offset: entry.data_offset,
+                    stored_size: entry.stored_size,
+                    raw_size: entry.raw_size,
+                    compression: entry.compression,
+                },
+            );
         }
-
-        writer.add(&bytes)?;
-    }
-
-    if writer.estimated_stored_size() > 0 {
-        flush_pack(writer, packs_directory, &mut packs, &mut locations)?;
     }
 
     Ok(PackIndex {
@@ -620,13 +663,93 @@ fn build_packs(
     })
 }
 
-fn flush_pack(
-    writer: PackWriter,
+#[derive(Debug)]
+struct PlannedPack {
+    ordinal: usize,
+    chunks: Vec<Sha256Digest>,
+}
+
+#[derive(Debug)]
+struct CompletedPack {
+    digest: Sha256Digest,
+    size: u64,
+    entries: Vec<pako_core::pack::PackEntry>,
+}
+
+fn plan_packs(
+    required: BTreeSet<Sha256Digest>,
+    chunks_directory: &Path,
+) -> anyhow::Result<Vec<PlannedPack>> {
+    let mut planned = Vec::new();
+    let mut chunks = Vec::new();
+    let mut size = 0_u64;
+
+    for digest in required {
+        let chunk_size = std::fs::metadata(chunks_directory.join(digest.hex()))?.len();
+        if !chunks.is_empty() && size + chunk_size > SOFT_PACK_LIMIT {
+            planned.push(PlannedPack {
+                ordinal: planned.len(),
+                chunks,
+            });
+            chunks = Vec::new();
+            size = 0;
+        }
+        chunks.push(digest);
+        size += chunk_size;
+    }
+
+    if !chunks.is_empty() {
+        planned.push(PlannedPack {
+            ordinal: planned.len(),
+            chunks,
+        });
+    }
+
+    Ok(planned)
+}
+
+fn compress_packs(
+    planned: Vec<PlannedPack>,
+    chunks_directory: &Path,
+    packs_directory: &Path,
+    worker_count: usize,
+) -> anyhow::Result<Vec<CompletedPack>> {
+    let queue = Mutex::new(VecDeque::from(planned));
+    let results = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                let Some(pack) = queue.lock().expect("pack queue lock poisoned").pop_front() else {
+                    return;
+                };
+                let result = compress_pack(pack, chunks_directory, packs_directory);
+                results
+                    .lock()
+                    .expect("pack result lock poisoned")
+                    .push(result);
+            });
+        }
+    });
+
+    results
+        .into_inner()
+        .expect("pack result lock poisoned")
+        .into_iter()
+        .collect()
+}
+
+fn compress_pack(
+    planned: PlannedPack,
+    chunks_directory: &Path,
     directory: &Path,
-    packs: &mut BTreeMap<Sha256Digest, PackDescriptor>,
-    locations: &mut BTreeMap<Sha256Digest, ChunkLocation>,
-) -> anyhow::Result<()> {
-    let temporary = directory.join("building.pakopack");
+) -> anyhow::Result<CompletedPack> {
+    let mut writer = PackWriter::new();
+    for digest in planned.chunks {
+        writer.add(&std::fs::read(chunks_directory.join(digest.hex()))?)?;
+    }
+
+    let temporary = directory.join(format!("building-{}.pakopack", planned.ordinal));
     let (pack_digest, entries) = writer.finish(&temporary)?;
     let final_path = directory.join(format!("{}.pakopack", pack_digest.hex()));
 
@@ -637,22 +760,11 @@ fn flush_pack(
     }
 
     let size = std::fs::metadata(&final_path)?.len();
-    packs.insert(pack_digest, PackDescriptor { size });
-
-    for entry in entries {
-        locations.insert(
-            entry.digest,
-            ChunkLocation {
-                pack: pack_digest,
-                offset: entry.data_offset,
-                stored_size: entry.stored_size,
-                raw_size: entry.raw_size,
-                compression: entry.compression,
-            },
-        );
-    }
-
-    Ok(())
+    Ok(CompletedPack {
+        digest: pack_digest,
+        size,
+        entries,
+    })
 }
 
 fn apply_transforms(root: &Path, transforms: &[Transform]) -> anyhow::Result<()> {

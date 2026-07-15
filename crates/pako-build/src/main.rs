@@ -6,7 +6,7 @@ mod recipe;
 mod sandbox;
 mod tuf;
 
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
@@ -147,6 +147,11 @@ struct BuildArgs {
     /// written.
     #[arg(long, value_name = "DIRECTORY", default_value = "build")]
     output: PathBuf,
+
+    /// Maximum number of packs to compress concurrently. Defaults to all
+    /// available CPUs.
+    #[arg(long, value_name = "JOBS")]
+    jobs: Option<NonZeroUsize>,
 }
 
 const PUBLISH_LONG_ABOUT: &str = "\
@@ -256,7 +261,11 @@ async fn main() -> anyhow::Result<()> {
                 arguments.target
             );
             let recipe = recipe::Recipe::load(&arguments.recipe)?;
-            let report = builder::Builder::new(arguments.output)?
+            let jobs = arguments.jobs.map_or_else(
+                || std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+                NonZeroUsize::get,
+            );
+            let report = builder::Builder::new(arguments.output, jobs)?
                 .build(&recipe, &arguments.target)
                 .await?;
 
