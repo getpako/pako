@@ -147,7 +147,7 @@ pub fn recover(layout: &Layout) -> Result<Vec<String>> {
         let _lock = PackageLock::acquire(layout, &journal.package)?;
         match journal.recovery {
             RecoveryAction::Rollback => {
-                recover_rollback(&journal, &staging, &final_path, &current)?;
+                recover_rollback(layout, &journal, &staging, &final_path, &current)?;
             }
             RecoveryAction::RollForward => {
                 recover_roll_forward(layout, &journal, &final_path, &current)?;
@@ -243,13 +243,14 @@ fn ensure_exposure_path(layout: &Layout, path: &Path) -> Result<()> {
 }
 
 fn recover_rollback(
+    layout: &Layout,
     journal: &Journal,
     staging: &Path,
     final_path: &Path,
     current: &Path,
 ) -> Result<()> {
     if let Some(commit) = &journal.commit {
-        integrations::cleanup_prepared(&commit.exposures);
+        integrations::ExposureTransaction::recover_rollback(layout, &commit.exposures)?;
     }
     if staging.exists() {
         std::fs::remove_dir_all(staging).at(staging)?;
@@ -288,7 +289,7 @@ fn recover_roll_forward(
         .as_ref()
         .ok_or_else(|| Error::Transaction("roll-forward journal has no commit plan".into()))?;
     activate_symlink(final_path, current)?;
-    integrations::publish(&commit.exposures)?;
+    integrations::ExposureTransaction::recover_commit(layout, &commit.exposures)?;
     commit
         .receipt
         .save_atomic(&layout.receipt(&journal.package)?)

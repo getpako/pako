@@ -1,9 +1,11 @@
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
+
+use fs2::FileExt;
 
 use crate::{
     error::IoContext,
@@ -23,59 +25,148 @@ pub struct PreparedExposure {
     pub receipt: ExposureReceipt,
 }
 
-/// Check every conflict and write all integration files under transaction
-/// private names. Nothing is visible at its final destination yet.
-pub fn prepare(
-    manifest: &PackageManifest,
-    layout: &Layout,
-    tree: &Path,
-    transaction_id: &str,
-) -> Result<Vec<PreparedExposure>> {
-    let mut planned = Vec::new();
+#[derive(Debug)]
+struct PlannedExposure {
+    kind: &'static str,
+    path: PathBuf,
+    data: Vec<u8>,
+    mode: u32,
+}
 
-    for launcher in &manifest.integrations.launchers {
-        let path = layout.bin.join(&launcher.name);
-        let content = render_launcher(&manifest.package, launcher, layout);
-        planned.push(("launcher", path, content.into_bytes(), 0o755));
-    }
-    for desktop_entry in &manifest.integrations.desktop_entries {
-        let path = layout
-            .applications
-            .join(format!("pako-{}.desktop", desktop_entry.id));
-        let content = render_desktop_entry(desktop_entry);
-        planned.push(("desktop", path, content.into_bytes(), 0o644));
-    }
-    for icon in &manifest.integrations.icons {
-        let (directory, extension) = icon_destination(icon, layout)?;
-        let path = directory.join(format!("{}.{}", icon.name, extension));
-        let source = tree.join(icon.source.as_str());
-        planned.push(("icon", path, std::fs::read(&source).at(&source)?, 0o644));
+/// Serializes all package integrations. Package locks cannot prevent two
+/// distinct packages from claiming the same launcher or desktop entry.
+#[derive(Debug)]
+pub struct ExposureTransaction {
+    transaction_id: String,
+    planned: Vec<PlannedExposure>,
+    prepared: Vec<PreparedExposure>,
+    _lock: File,
+}
+
+impl ExposureTransaction {
+    pub fn begin(layout: &Layout, transaction_id: impl Into<String>) -> Result<Self> {
+        let directory = layout.locks();
+        std::fs::create_dir_all(&directory).at(&directory)?;
+        let path = directory.join("exposures.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .at(&path)?;
+        lock.lock_exclusive().at(&path)?;
+        Ok(Self {
+            transaction_id: transaction_id.into(),
+            planned: Vec::new(),
+            prepared: Vec::new(),
+            _lock: lock,
+        })
     }
 
-    // Do the complete conflict pass before creating any temporary file.
-    for (_, path, _, _) in &planned {
-        ensure_available(path)?;
-        ensure_available(&temporary_path(path, transaction_id))?;
-    }
+    /// Calculate every destination and reject every conflict before touching
+    /// the filesystem outside the package tree.
+    pub fn preflight(
+        &mut self,
+        manifest: &PackageManifest,
+        layout: &Layout,
+        tree: &Path,
+    ) -> Result<()> {
+        let mut planned = Vec::new();
 
-    let mut prepared = Vec::new();
-    for (kind, path, data, mode) in planned {
-        let temporary = temporary_path(&path, transaction_id);
-        if let Err(error) = write_exposure(&temporary, &data, mode) {
-            cleanup_prepared(&prepared);
-            return Err(error);
+        for launcher in &manifest.integrations.launchers {
+            let path = layout.bin.join(&launcher.name);
+            let content = render_launcher(&manifest.package, launcher, layout);
+            planned.push(PlannedExposure {
+                kind: "launcher",
+                path,
+                data: content.into_bytes(),
+                mode: 0o755,
+            });
         }
-        prepared.push(PreparedExposure {
-            temporary: temporary.display().to_string(),
-            receipt: exposure_receipt(kind, &path, &data),
-        });
+        for desktop_entry in &manifest.integrations.desktop_entries {
+            let path = layout
+                .applications
+                .join(format!("pako-{}.desktop", desktop_entry.id));
+            let content = render_desktop_entry(desktop_entry);
+            planned.push(PlannedExposure {
+                kind: "desktop",
+                path,
+                data: content.into_bytes(),
+                mode: 0o644,
+            });
+        }
+        for icon in &manifest.integrations.icons {
+            let (directory, extension) = icon_destination(icon, layout)?;
+            let path = directory.join(format!("{}.{}", icon.name, extension));
+            let source = tree.join(icon.source.as_str());
+            planned.push(PlannedExposure {
+                kind: "icon",
+                path,
+                data: std::fs::read(&source).at(&source)?,
+                mode: 0o644,
+            });
+        }
+
+        for plan in &planned {
+            ensure_available(&plan.path)?;
+            ensure_available(&temporary_path(&plan.path, &self.transaction_id))?;
+        }
+        self.planned = planned;
+        Ok(())
     }
-    Ok(prepared)
+
+    /// Write every artifact to its private temporary name.
+    pub fn prepare(&mut self) -> Result<&[PreparedExposure]> {
+        for plan in &self.planned {
+            let temporary = temporary_path(&plan.path, &self.transaction_id);
+            if let Err(error) = write_exposure(&temporary, &plan.data, plan.mode) {
+                self.rollback();
+                return Err(error);
+            }
+            self.prepared.push(PreparedExposure {
+                temporary: temporary.display().to_string(),
+                receipt: exposure_receipt(plan.kind, &plan.path, &plan.data),
+            });
+        }
+        Ok(&self.prepared)
+    }
+
+    /// Publish the preflighted files while the global exposure lock is held.
+    pub fn commit(&mut self) -> Result<()> {
+        publish(&self.prepared)
+    }
+
+    /// Remove only temporary files created by this transaction. Published
+    /// files are intentionally retained for roll-forward recovery.
+    pub fn rollback(&mut self) {
+        cleanup_prepared(&self.prepared);
+        self.prepared.clear();
+    }
+
+    pub fn prepared(&self) -> &[PreparedExposure] {
+        &self.prepared
+    }
+
+    /// Recovery gets the same global lock before idempotently completing a
+    /// journaled publication.
+    pub fn recover_commit(layout: &Layout, prepared: &[PreparedExposure]) -> Result<()> {
+        let mut transaction = Self::begin(layout, "recovery")?;
+        transaction.prepared = prepared.to_vec();
+        transaction.commit()
+    }
+
+    pub fn recover_rollback(layout: &Layout, prepared: &[PreparedExposure]) -> Result<()> {
+        let mut transaction = Self::begin(layout, "recovery")?;
+        transaction.prepared = prepared.to_vec();
+        transaction.rollback();
+        Ok(())
+    }
 }
 
 /// Publish prepared files. It is safe to call repeatedly after a crash: an
 /// already-published file must match the transaction receipt.
-pub fn publish(prepared: &[PreparedExposure]) -> Result<()> {
+fn publish(prepared: &[PreparedExposure]) -> Result<()> {
     for exposure in prepared {
         let destination = Path::new(&exposure.receipt.path);
         let temporary = Path::new(&exposure.temporary);
@@ -245,4 +336,25 @@ fn escape_desktop_value(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('\r', "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_exposure_lock_excludes_another_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let layout = Layout::for_test(directory.path());
+        layout.ensure().unwrap();
+        let _transaction = ExposureTransaction::begin(&layout, "first").unwrap();
+
+        let path = layout.locks().join("exposures.lock");
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(second.try_lock_exclusive().is_err());
+    }
 }

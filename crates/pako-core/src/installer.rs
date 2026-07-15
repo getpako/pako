@@ -113,7 +113,9 @@ impl Installer {
             exposures: Vec::new(),
         };
 
-        let prepared = integrations::prepare(manifest, &self.layout, &staging, &journal.id)?;
+        let mut exposures = integrations::ExposureTransaction::begin(&self.layout, &journal.id)?;
+        exposures.preflight(manifest, &self.layout, &staging)?;
+        let prepared = exposures.prepare()?.to_vec();
         let mut receipt = receipt;
         receipt.exposures = prepared
             .iter()
@@ -134,11 +136,7 @@ impl Installer {
         journal.advance(&self.layout, Phase::Committing)?;
 
         activate_symlink(&final_path, &current_link)?;
-        let commit = journal
-            .commit
-            .as_ref()
-            .expect("commit plan was saved before tree commit");
-        integrations::publish(&commit.exposures)?;
+        exposures.commit()?;
         receipt.save_atomic(&self.layout.receipt(&manifest.package)?)?;
 
         journal.advance(&self.layout, Phase::Complete)?;
@@ -192,6 +190,8 @@ impl Installer {
         let receipt_path = self.layout.receipt(package)?;
         let receipt = Receipt::load(&receipt_path)?;
 
+        let _exposures =
+            integrations::ExposureTransaction::begin(&self.layout, format!("remove-{package}"))?;
         integrations::remove(&receipt.exposures)?;
         remove_symlink_if_present(&self.layout.current_link(package)?)?;
         remove_directory_if_present(&self.layout.cellar().join(package))?;
