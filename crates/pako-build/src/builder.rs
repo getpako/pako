@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -204,7 +204,7 @@ impl Builder {
         let chunks_directory = output.join("chunks");
         std::fs::create_dir_all(&chunks_directory)?;
 
-        let mut entries = scan_tree(payload, &chunks_directory)?;
+        let mut entries = scan_tree(payload, &chunks_directory, self.jobs)?;
         info!("scanned {} payload entries", entries.len());
         entries.sort_by(|left, right| left.path().cmp(right.path()));
 
@@ -416,8 +416,8 @@ fn download_progress(source_name: &str, length: Option<u64>) -> ProgressBar {
 mod tests {
     use tempfile::TempDir;
 
-    use super::{compress_packs, source_filename_from_url, PlannedPack};
-    use pako_core::{pack::PackReader, Sha256Digest};
+    use super::{compress_packs, scan_tree, source_filename_from_url, PlannedPack};
+    use pako_core::{manifest::Entry, pack::PackReader, Sha256Digest};
 
     #[test]
     fn derives_filename_from_source_url() {
@@ -469,6 +469,25 @@ mod tests {
             PackReader::open(&packs.join(format!("{}.pakopack", pack.digest.hex()))).unwrap();
         }
     }
+
+    #[test]
+    fn scans_multiple_files_with_parallel_workers() {
+        let temporary = TempDir::new().unwrap();
+        let payload = temporary.path().join("payload");
+        let chunks = temporary.path().join("chunks");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::create_dir_all(&chunks).unwrap();
+        std::fs::write(payload.join("first"), b"first file").unwrap();
+        std::fs::write(payload.join("second"), b"second file").unwrap();
+
+        let entries = scan_tree(&payload, &chunks, 2).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| matches!(entry, Entry::File { .. })));
+        assert_eq!(std::fs::read_dir(&chunks).unwrap().count(), 2);
+    }
 }
 
 #[derive(Debug)]
@@ -515,8 +534,17 @@ fn build_environment(target: &Target, jobs: usize) -> BTreeMap<String, String> {
     ])
 }
 
-fn scan_tree(root: &Path, chunks_directory: &Path) -> anyhow::Result<Vec<Entry>> {
+#[derive(Debug)]
+struct FileScanTask {
+    path: PathBuf,
+    package_path: PackagePath,
+    mode: u16,
+    size: u64,
+}
+
+fn scan_tree(root: &Path, chunks_directory: &Path, jobs: usize) -> anyhow::Result<Vec<Entry>> {
     let mut entries = Vec::new();
+    let mut files = Vec::new();
 
     for item in WalkDir::new(root)
         .follow_links(false)
@@ -549,29 +577,63 @@ fn scan_tree(root: &Path, chunks_directory: &Path) -> anyhow::Result<Vec<Entry>>
                 target,
             });
         } else if metadata.is_file() {
-            entries.push(scan_file(
-                path,
-                relative,
+            files.push(FileScanTask {
+                path: path.to_owned(),
+                package_path: relative,
                 mode,
-                &metadata,
-                chunks_directory,
-            )?);
+                size: metadata.len(),
+            });
         } else {
             anyhow::bail!("unsupported filesystem entry: {}", path.display());
         }
     }
 
+    let worker_count = jobs.max(1).min(files.len().max(1));
+    info!(
+        "scanning {} files with {worker_count} worker(s)",
+        files.len()
+    );
+    entries.extend(scan_files(files, chunks_directory, worker_count)?);
+
     Ok(entries)
 }
 
-fn scan_file(
-    path: &Path,
-    package_path: PackagePath,
-    mode: u16,
-    metadata: &std::fs::Metadata,
+fn scan_files(
+    files: Vec<FileScanTask>,
     chunks_directory: &Path,
-) -> anyhow::Result<Entry> {
-    let mut file = File::open(path)?;
+    worker_count: usize,
+) -> anyhow::Result<Vec<Entry>> {
+    let queue = Mutex::new(VecDeque::from(files));
+    let results = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                let Some(file) = queue
+                    .lock()
+                    .expect("file scan queue lock poisoned")
+                    .pop_front()
+                else {
+                    return;
+                };
+                let result = scan_file(file, chunks_directory);
+                results
+                    .lock()
+                    .expect("file scan result lock poisoned")
+                    .push(result);
+            });
+        }
+    });
+
+    results
+        .into_inner()
+        .expect("file scan result lock poisoned")
+        .into_iter()
+        .collect()
+}
+
+fn scan_file(task: FileScanTask, chunks_directory: &Path) -> anyhow::Result<Entry> {
+    let mut file = File::open(&task.path)?;
     let boundaries = PakoFastCdcV1.boundaries(&mut file)?;
     let mut chunks = Vec::with_capacity(boundaries.len());
     let mut file_hash = Sha256::new();
@@ -583,10 +645,7 @@ fn scan_file(
         file_hash.update(&bytes);
 
         let digest = Sha256Digest::calculate(&bytes);
-        let chunk_path = chunks_directory.join(digest.hex());
-        if !chunk_path.exists() {
-            std::fs::write(&chunk_path, &bytes)?;
-        }
+        store_chunk(chunks_directory, digest, &bytes)?;
 
         chunks.push(ChunkRef {
             digest,
@@ -594,19 +653,31 @@ fn scan_file(
         });
     }
 
-    let digest = if metadata.len() == 0 {
+    let digest = if task.size == 0 {
         Sha256Digest::EMPTY
     } else {
         Sha256Digest::from_bytes(file_hash.finalize().into())
     };
 
     Ok(Entry::File {
-        path: package_path,
-        mode,
-        size: metadata.len(),
+        path: task.package_path,
+        mode: task.mode,
+        size: task.size,
         digest,
         chunks,
     })
+}
+
+fn store_chunk(chunks_directory: &Path, digest: Sha256Digest, bytes: &[u8]) -> anyhow::Result<()> {
+    let path = chunks_directory.join(digest.hex());
+    match File::options().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(bytes)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn build_packs(
