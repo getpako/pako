@@ -1,5 +1,6 @@
 mod archive;
 mod builder;
+mod logging;
 mod publisher;
 mod recipe;
 mod sandbox;
@@ -7,7 +8,7 @@ mod tuf;
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 
 const ROOT_LONG_ABOUT: &str = "\
 Build Pako package artifacts from a versioned recipe.
@@ -93,6 +94,10 @@ Generated files include:
     disable_help_subcommand = true
 )]
 struct Cli {
+    /// Increase log detail. Repeat for trace-level diagnostics.
+    #[arg(short, long, action = ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -232,9 +237,11 @@ root, targets, snapshot, and timestamp metadata.",
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    logging::init(cli.verbose)?;
 
     match cli.command {
         Command::Lint(arguments) => {
+            log::info!("validating recipe {}", arguments.recipe.display());
             let recipe = recipe::Recipe::load(&arguments.recipe)?;
             recipe.validate()?;
             println!(
@@ -243,6 +250,11 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Command::Build(arguments) => {
+            log::info!(
+                "building recipe {} for {}",
+                arguments.recipe.display(),
+                arguments.target
+            );
             let recipe = recipe::Recipe::load(&arguments.recipe)?;
             let report = builder::Builder::new(arguments.output)?
                 .build(&recipe, &arguments.target)
@@ -257,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
             println!("pack index: {}", report.pack_index.display());
         }
         Command::Publish(arguments) => {
+            log::info!(
+                "publishing artifact {} to {}",
+                arguments.artifact.display(),
+                arguments.reference
+            );
             let credentials = arguments.username.zip(arguments.password);
             let reference = arguments.reference.clone();
             let digest = publisher::publish(
@@ -285,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Tuf(arguments) => match arguments.command {
             TufCommand::Init { directory } => {
+                log::info!("initializing TUF repository {}", directory.display());
                 tuf::init(&directory).await?;
                 println!("initialized local TUF repository: {}", directory.display());
             }

@@ -20,6 +20,7 @@ futures-util.workspace = true
 hex.workspace = true
 indicatif.workspace = true
 jiff.workspace = true
+log.workspace = true
 pako-core = { path = "../pako-core" }
 pako-oci = { path = "../pako-oci" }
 reqwest.workspace = true

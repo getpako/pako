@@ -9,6 +9,7 @@ use std::{
 
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use log::{debug, info, trace, warn};
 use pako_core::{
     canonical,
     chunking::{Chunker, PakoFastCdcV1},
@@ -73,12 +74,19 @@ impl Builder {
             .ok_or_else(|| anyhow::anyhow!("target not found: {target_name}"))?;
 
         let workspace = BuildWorkspace::create()?;
+        debug!("created temporary build workspace");
+        trace!(
+            "temporary build workspace: {}",
+            workspace.temporary.path().display()
+        );
         self.prepare_sources(recipe, target, &workspace).await?;
 
         if !target.build.scripts.is_empty() {
+            info!("running source build stages");
             self.run_source_build(recipe, target, &workspace).await?;
         }
 
+        info!("applying payload transforms and assertions");
         apply_transforms(&workspace.payload, &recipe.transforms)?;
         apply_transforms(&workspace.payload, &target.transforms)?;
         check_assertions(&workspace.payload, &recipe.assertions)?;
@@ -95,10 +103,13 @@ impl Builder {
     ) -> anyhow::Result<()> {
         for (index, source) in target.sources.iter().enumerate() {
             let downloaded = workspace.sources.join(format!("source-{}", index + 1));
+            info!("preparing source {}", source_filename(source));
+            trace!("temporary source path: {}", downloaded.display());
             self.download_source(source, recipe.recipe_dir(), &downloaded)
                 .await?;
 
             if let Some(format) = source.format.as_deref() {
+                info!("extracting {format} archive");
                 archive::extract(
                     &downloaded,
                     format,
@@ -108,6 +119,7 @@ impl Builder {
             } else {
                 let source_name = source_filename(source);
                 let destination = source.destination.as_deref().unwrap_or(&source_name);
+                info!("placing source at {destination}");
                 let destination =
                     PackagePath::new(destination.to_owned())?.join_to(&workspace.payload);
                 if let Some(parent) = destination.parent() {
@@ -131,6 +143,7 @@ impl Builder {
             .environment
             .clone()
             .ok_or_else(|| anyhow::anyhow!("source build requires an environment"))?;
+        info!("using build environment {image}");
         let sandbox = Sandbox {
             image,
             network: target.build.network,
@@ -183,12 +196,14 @@ impl Builder {
                 output.display()
             );
         }
+        info!("packaging payload into {}", output.display());
         std::fs::create_dir_all(&output)?;
 
         let chunks_directory = output.join("chunks");
         std::fs::create_dir_all(&chunks_directory)?;
 
         let mut entries = scan_tree(payload, &chunks_directory)?;
+        info!("scanned {} payload entries", entries.len());
         entries.sort_by(|left, right| left.path().cmp(right.path()));
 
         let tree_digest = compute_tree_digest(&entries);
@@ -256,6 +271,7 @@ impl Builder {
         let partial = destination.with_extension("partial");
 
         if let Some(path) = &source.path {
+            info!("copying local source {path}");
             self.copy_local_source(path, recipe_directory, expected, &partial)
                 .await?;
             tokio::fs::rename(&partial, destination).await?;
@@ -274,7 +290,7 @@ impl Builder {
                 }
                 Err(error) => {
                     let _ = tokio::fs::remove_file(&partial).await;
-                    eprintln!("source mirror failed for {source_name}: {error:#}");
+                    warn!("source mirror failed for {source_name}: {error:#}");
                 }
             }
         }
@@ -311,7 +327,12 @@ impl Builder {
         expected_digest: Sha256Digest,
         destination: &Path,
     ) -> anyhow::Result<()> {
+        info!("downloading {source_name} from {url}");
         let response = self.http.get(url).send().await?.error_for_status()?;
+        trace!(
+            "response content length for {source_name}: {:?}",
+            response.content_length()
+        );
         let progress = download_progress(source_name, response.content_length());
         let mut stream = response.bytes_stream();
         let mut output = tokio::fs::File::create(destination).await?;
@@ -410,7 +431,7 @@ mod tests {
 
 #[derive(Debug)]
 struct BuildWorkspace {
-    _temporary: TempDir,
+    temporary: TempDir,
     sources: PathBuf,
     payload: PathBuf,
     build: PathBuf,
@@ -430,7 +451,7 @@ impl BuildWorkspace {
         }
 
         Ok(Self {
-            _temporary: temporary,
+            temporary,
             sources,
             payload,
             build,

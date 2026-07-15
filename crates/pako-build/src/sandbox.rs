@@ -25,6 +25,8 @@ impl Sandbox {
         destination: &Path,
         environment: &BTreeMap<String, String>,
     ) -> anyhow::Result<()> {
+        log::info!("running {phase} build phase in {}", self.image);
+        log::info!("sandbox network access: {}", self.network);
         let mut command = Command::new("podman");
         command.args([
             "run",

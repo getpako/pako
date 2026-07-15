@@ -1159,6 +1159,7 @@ dependencies = [
  "hex",
  "indicatif",
  "jiff",
+ "log",
  "pako-core",
  "pako-oci",
  "reqwest 0.12.28",
