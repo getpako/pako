@@ -1221,6 +1221,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "indicatif",
  "pako-core",
  "reqwest 0.12.28",
  "serde",

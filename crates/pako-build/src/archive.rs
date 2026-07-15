@@ -5,6 +5,7 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
 use tar::Archive;
 
 /// Extract a supported archive into `destination` while rejecting path
@@ -31,36 +32,50 @@ pub(crate) fn extract(
 
 fn extract_tar(reader: impl Read, destination: &Path, strip_components: u32) -> anyhow::Result<()> {
     let mut archive = Archive::new(reader);
+    let progress = extraction_progress(None, "extracting archive");
 
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_type = entry.header().entry_type();
+    let result = (|| {
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let entry_type = entry.header().entry_type();
 
-        if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink()) {
-            anyhow::bail!("unsupported archive entry type");
+            if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink()) {
+                anyhow::bail!("unsupported archive entry type");
+            }
+
+            let archive_path = entry.path()?.into_owned();
+            let relative = strip_path(&archive_path, strip_components)?;
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+
+            let output = destination.join(&relative);
+            ensure_inside(destination, &output)?;
+            ensure_no_symlink_ancestor(destination, &output)?;
+
+            if entry_type.is_symlink() {
+                let target = entry
+                    .link_name()?
+                    .ok_or_else(|| anyhow::anyhow!("symlink entry has no target"))?;
+                validate_symlink_target(&relative, &target)?;
+            }
+
+            entry.unpack(&output)?;
+            progress.inc(1);
         }
+        Ok::<_, anyhow::Error>(())
+    })();
 
-        let archive_path = entry.path()?.into_owned();
-        let relative = strip_path(&archive_path, strip_components)?;
-        if relative.as_os_str().is_empty() {
-            continue;
+    match result {
+        Ok(()) => {
+            progress.finish_with_message("extracted archive");
+            Ok(())
         }
-
-        let output = destination.join(&relative);
-        ensure_inside(destination, &output)?;
-        ensure_no_symlink_ancestor(destination, &output)?;
-
-        if entry_type.is_symlink() {
-            let target = entry
-                .link_name()?
-                .ok_or_else(|| anyhow::anyhow!("symlink entry has no target"))?;
-            validate_symlink_target(&relative, &target)?;
+        Err(error) => {
+            progress.abandon_with_message("archive extraction failed");
+            Err(error)
         }
-
-        entry.unpack(&output)?;
     }
-
-    Ok(())
 }
 
 fn extract_zip(
@@ -69,34 +84,66 @@ fn extract_zip(
     strip_components: u32,
 ) -> anyhow::Result<()> {
     let mut archive = zip::ZipArchive::new(&mut file)?;
+    let progress = extraction_progress(Some(archive.len()), "extracting archive");
 
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        let archive_path = entry
-            .enclosed_name()
-            .ok_or_else(|| anyhow::anyhow!("unsafe ZIP path"))?
-            .clone();
-        let relative = strip_path(&archive_path, strip_components)?;
-        if relative.as_os_str().is_empty() {
-            continue;
+    let result = (|| {
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index)?;
+            let archive_path = entry
+                .enclosed_name()
+                .ok_or_else(|| anyhow::anyhow!("unsafe ZIP path"))?
+                .clone();
+            let relative = strip_path(&archive_path, strip_components)?;
+            progress.inc(1);
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+
+            let output = destination.join(&relative);
+            ensure_inside(destination, &output)?;
+            ensure_no_symlink_ancestor(destination, &output)?;
+
+            if entry.is_dir() {
+                std::fs::create_dir_all(&output)?;
+                continue;
+            }
+
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::io::copy(&mut entry, &mut File::create(&output)?)?;
         }
+        Ok::<_, anyhow::Error>(())
+    })();
 
-        let output = destination.join(&relative);
-        ensure_inside(destination, &output)?;
-        ensure_no_symlink_ancestor(destination, &output)?;
-
-        if entry.is_dir() {
-            std::fs::create_dir_all(&output)?;
-            continue;
+    match result {
+        Ok(()) => {
+            progress.finish_with_message("extracted archive");
+            Ok(())
         }
-
-        if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent)?;
+        Err(error) => {
+            progress.abandon_with_message("archive extraction failed");
+            Err(error)
         }
-        std::io::copy(&mut entry, &mut File::create(&output)?)?;
     }
+}
 
-    Ok(())
+fn extraction_progress(total: Option<usize>, message: &str) -> ProgressBar {
+    let progress = total.map_or_else(ProgressBar::new_spinner, |total| {
+        ProgressBar::new(total as u64)
+    });
+    let style = match total {
+        Some(_) => ProgressStyle::with_template(
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} entries ({per_sec})",
+        ),
+        None => ProgressStyle::with_template("{spinner:.green} {msg} {pos} entries ({per_sec})"),
+    }
+    .expect("archive extraction progress template is valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.set_message(message.to_owned());
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
+    progress
 }
 
 fn strip_path(path: &Path, count: u32) -> anyhow::Result<PathBuf> {
