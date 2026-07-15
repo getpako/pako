@@ -593,7 +593,19 @@ fn scan_tree(root: &Path, chunks_directory: &Path, jobs: usize) -> anyhow::Resul
         "scanning {} files with {worker_count} worker(s)",
         files.len()
     );
-    entries.extend(scan_files(files, chunks_directory, worker_count)?);
+    let file_count = files.len();
+    let progress = scan_progress(file_count);
+    let scanned = scan_files(files, chunks_directory, worker_count, &progress);
+    match scanned {
+        Ok(scanned) => {
+            progress.finish_with_message(format!("scanned {file_count} files"));
+            entries.extend(scanned);
+        }
+        Err(error) => {
+            progress.abandon_with_message("file scan failed");
+            return Err(error);
+        }
+    }
 
     Ok(entries)
 }
@@ -602,6 +614,7 @@ fn scan_files(
     files: Vec<FileScanTask>,
     chunks_directory: &Path,
     worker_count: usize,
+    progress: &ProgressBar,
 ) -> anyhow::Result<Vec<Entry>> {
     let queue = Mutex::new(VecDeque::from(files));
     let results = Mutex::new(Vec::new());
@@ -617,6 +630,7 @@ fn scan_files(
                     return;
                 };
                 let result = scan_file(file, chunks_directory);
+                progress.inc(1);
                 results
                     .lock()
                     .expect("file scan result lock poisoned")
@@ -630,6 +644,19 @@ fn scan_files(
         .expect("file scan result lock poisoned")
         .into_iter()
         .collect()
+}
+
+fn scan_progress(file_count: usize) -> ProgressBar {
+    let progress = ProgressBar::new(file_count as u64);
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} files ({per_sec})",
+    )
+    .expect("file scan progress template is valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.set_message("scanning payload");
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
 }
 
 fn scan_file(task: FileScanTask, chunks_directory: &Path) -> anyhow::Result<Entry> {
