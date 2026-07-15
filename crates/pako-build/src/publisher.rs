@@ -125,7 +125,7 @@ pub(crate) async fn publish(
             size: u64::try_from(manifest_bytes.len())?,
             annotations: BTreeMap::default(),
             platform: Some(Platform {
-                architecture: architecture.into(),
+                architecture: oci_architecture(architecture)?.into(),
                 os: os.into(),
             }),
         }],
@@ -144,6 +144,14 @@ pub(crate) async fn publish(
     client
         .push_manifest(&reference, OCI_IMAGE_INDEX_MEDIA_TYPE, &index_bytes)
         .await
+}
+
+fn oci_architecture(architecture: &str) -> anyhow::Result<&'static str> {
+    match architecture {
+        "x86_64" => Ok("amd64"),
+        "aarch64" => Ok("arm64"),
+        _ => anyhow::bail!("unsupported Pako architecture for OCI: {architecture}"),
+    }
 }
 
 #[derive(Debug)]
