@@ -13,7 +13,7 @@ use crate::{
     materialize,
     object_store::ObjectStore,
     receipt::Receipt,
-    transaction::{activate_symlink, Journal, PackageLock, Phase},
+    transaction::{activate_symlink, CommitPlan, Journal, PackageLock, Phase, RecoveryAction},
     verify, Result, Sha256Digest,
 };
 
@@ -88,21 +88,10 @@ impl Installer {
         verify::verify_tree(manifest, &staging)?;
         journal.advance(&self.layout, Phase::Verified)?;
 
-        commit_tree(&staging, &final_path)?;
-        journal.advance(&self.layout, Phase::Committed)?;
-
-        activate_symlink(&final_path, &current_link)?;
-        let exposures = match integrations::install(manifest, &self.layout) {
-            Ok(exposures) => exposures,
-            Err(error) => {
-                restore_previous_activation(old_current.as_deref(), &current_link)?;
-                return Err(error);
-            }
-        };
-        journal.advance(&self.layout, Phase::Exposed)?;
-
+        // All possible integration conflicts are discovered before the new
+        // version becomes visible. Their content is staged under private
+        // names, allowing recovery to finish publication idempotently.
         self.save_release_metadata(manifest, index, &version)?;
-
         let receipt = Receipt {
             schema: 1,
             package: manifest.package.clone(),
@@ -121,11 +110,37 @@ impl Installer {
                 .filter_map(|path| path.file_name())
                 .map(|value| value.to_string_lossy().into_owned())
                 .collect(),
-            exposures,
+            exposures: Vec::new(),
         };
 
+        let prepared = integrations::prepare(manifest, &self.layout, &staging, &journal.id)?;
+        let mut receipt = receipt;
+        receipt.exposures = prepared
+            .iter()
+            .map(|exposure| exposure.receipt.clone())
+            .collect();
+        journal.commit = Some(CommitPlan {
+            receipt: receipt.clone(),
+            exposures: prepared,
+        });
+        journal.save(&self.layout)?;
+
+        commit_tree(&staging, &final_path)?;
+        journal.advance(&self.layout, Phase::TreeCommitted)?;
+
+        // This durable intent is the transaction boundary. From here recovery
+        // must complete the new version, never infer intent from final_path.
+        journal.recovery = RecoveryAction::RollForward;
+        journal.advance(&self.layout, Phase::Committing)?;
+
+        activate_symlink(&final_path, &current_link)?;
+        let commit = journal
+            .commit
+            .as_ref()
+            .expect("commit plan was saved before tree commit");
+        integrations::publish(&commit.exposures)?;
         receipt.save_atomic(&self.layout.receipt(&manifest.package)?)?;
-        journal.advance(&self.layout, Phase::ReceiptWritten)?;
+
         journal.advance(&self.layout, Phase::Complete)?;
         journal.remove(&self.layout)?;
 
@@ -199,7 +214,7 @@ impl Installer {
         old_current: Option<&Path>,
     ) -> Journal {
         Journal {
-            schema: 1,
+            schema: 2,
             id: format!("{}-{version}-{}", manifest.package, now_seconds()),
             package: manifest.package.clone(),
             phase: Phase::Prepared,
@@ -207,6 +222,8 @@ impl Installer {
             final_path: final_path.display().to_string(),
             old_current: old_current.map(|path| path.display().to_string()),
             new_current: final_path.display().to_string(),
+            recovery: RecoveryAction::Rollback,
+            commit: None,
         }
     }
 
@@ -261,15 +278,6 @@ fn commit_tree(staging: &Path, final_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent).at(parent)?;
     }
     std::fs::rename(staging, final_path).at(final_path)
-}
-
-fn restore_previous_activation(old_current: Option<&Path>, current_link: &Path) -> Result<()> {
-    if let Some(old_current) = old_current {
-        activate_symlink(old_current, current_link)?;
-    } else {
-        remove_symlink_if_present(current_link)?;
-    }
-    Ok(())
 }
 
 fn remove_symlink_if_present(path: &Path) -> Result<()> {

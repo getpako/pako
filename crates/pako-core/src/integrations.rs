@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::OpenOptions,
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -13,25 +13,104 @@ use crate::{
     Error, Result, Sha256Digest,
 };
 
-/// Create launchers, desktop entries and icons outside the managed package
-/// tree. Every created file is recorded by digest so removal never deletes a
-/// file which has since been replaced by the user.
-pub fn install(manifest: &PackageManifest, layout: &Layout) -> Result<Vec<ExposureReceipt>> {
-    let mut receipts = Vec::new();
+/// An exposure written under a private name, ready to be published during the
+/// transaction commit. Keeping this plan in the journal makes publication
+/// idempotent during recovery.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreparedExposure {
+    pub temporary: String,
+    pub receipt: ExposureReceipt,
+}
+
+/// Check every conflict and write all integration files under transaction
+/// private names. Nothing is visible at its final destination yet.
+pub fn prepare(
+    manifest: &PackageManifest,
+    layout: &Layout,
+    tree: &Path,
+    transaction_id: &str,
+) -> Result<Vec<PreparedExposure>> {
+    let mut planned = Vec::new();
 
     for launcher in &manifest.integrations.launchers {
-        receipts.push(install_launcher(manifest, launcher, layout)?);
+        let path = layout.bin.join(&launcher.name);
+        let content = render_launcher(&manifest.package, launcher, layout);
+        planned.push(("launcher", path, content.into_bytes(), 0o755));
     }
-
     for desktop_entry in &manifest.integrations.desktop_entries {
-        receipts.push(install_desktop_entry(desktop_entry, layout)?);
+        let path = layout
+            .applications
+            .join(format!("pako-{}.desktop", desktop_entry.id));
+        let content = render_desktop_entry(desktop_entry);
+        planned.push(("desktop", path, content.into_bytes(), 0o644));
     }
-
     for icon in &manifest.integrations.icons {
-        receipts.push(install_icon(manifest, icon, layout)?);
+        let (directory, extension) = icon_destination(icon, layout)?;
+        let path = directory.join(format!("{}.{}", icon.name, extension));
+        let source = tree.join(icon.source.as_str());
+        planned.push(("icon", path, std::fs::read(&source).at(&source)?, 0o644));
     }
 
-    Ok(receipts)
+    // Do the complete conflict pass before creating any temporary file.
+    for (_, path, _, _) in &planned {
+        ensure_available(path)?;
+        ensure_available(&temporary_path(path, transaction_id))?;
+    }
+
+    let mut prepared = Vec::new();
+    for (kind, path, data, mode) in planned {
+        let temporary = temporary_path(&path, transaction_id);
+        if let Err(error) = write_exposure(&temporary, &data, mode) {
+            cleanup_prepared(&prepared);
+            return Err(error);
+        }
+        prepared.push(PreparedExposure {
+            temporary: temporary.display().to_string(),
+            receipt: exposure_receipt(kind, &path, &data),
+        });
+    }
+    Ok(prepared)
+}
+
+/// Publish prepared files. It is safe to call repeatedly after a crash: an
+/// already-published file must match the transaction receipt.
+pub fn publish(prepared: &[PreparedExposure]) -> Result<()> {
+    for exposure in prepared {
+        let destination = Path::new(&exposure.receipt.path);
+        let temporary = Path::new(&exposure.temporary);
+        if destination.exists() {
+            let data = std::fs::read(destination).at(destination)?;
+            if Sha256Digest::calculate(&data) != exposure.receipt.digest {
+                return Err(Error::ExposureConflict(destination.to_owned()));
+            }
+            if temporary.symlink_metadata().is_ok() {
+                std::fs::remove_file(temporary).at(temporary)?;
+            }
+            continue;
+        }
+        if !temporary.exists() {
+            return Err(Error::Transaction(format!(
+                "prepared exposure is missing: {}",
+                temporary.display()
+            )));
+        }
+        // `rename` would replace a file created after preflight. Linking is
+        // an atomic no-replace publication because temporary and destination
+        // are deliberately siblings in the same filesystem.
+        std::fs::hard_link(temporary, destination).at(destination)?;
+        std::fs::remove_file(temporary).at(temporary)?;
+    }
+    Ok(())
+}
+
+pub fn cleanup_prepared(prepared: &[PreparedExposure]) {
+    for exposure in prepared {
+        let path = Path::new(&exposure.temporary);
+        if path.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Remove only exposure files whose content still matches the receipt.
@@ -49,50 +128,6 @@ pub fn remove(receipts: &[ExposureReceipt]) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn install_launcher(
-    manifest: &PackageManifest,
-    launcher: &Launcher,
-    layout: &Layout,
-) -> Result<ExposureReceipt> {
-    let path = layout.bin.join(&launcher.name);
-    ensure_available(&path)?;
-
-    let content = render_launcher(&manifest.package, launcher, layout);
-    write_exposure(&path, content.as_bytes(), 0o755)?;
-    Ok(exposure_receipt("launcher", &path, content.as_bytes()))
-}
-
-fn install_desktop_entry(desktop_entry: &DesktopEntry, layout: &Layout) -> Result<ExposureReceipt> {
-    let path = layout
-        .applications
-        .join(format!("pako-{}.desktop", desktop_entry.id));
-    ensure_available(&path)?;
-
-    let content = render_desktop_entry(desktop_entry);
-    write_exposure(&path, content.as_bytes(), 0o644)?;
-    Ok(exposure_receipt("desktop", &path, content.as_bytes()))
-}
-
-fn install_icon(
-    manifest: &PackageManifest,
-    icon: &Icon,
-    layout: &Layout,
-) -> Result<ExposureReceipt> {
-    let (directory, extension) = icon_destination(icon, layout)?;
-    std::fs::create_dir_all(&directory).at(&directory)?;
-
-    let path = directory.join(format!("{}.{}", icon.name, extension));
-    ensure_available(&path)?;
-
-    let source = layout
-        .current_link(&manifest.package)?
-        .join(icon.source.as_str());
-    let data = std::fs::read(&source).at(&source)?;
-    write_exposure(&path, &data, 0o644)?;
-
-    Ok(exposure_receipt("icon", &path, &data))
 }
 
 fn render_launcher(package: &str, launcher: &Launcher, layout: &Layout) -> String {
@@ -145,21 +180,23 @@ fn write_exposure(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         std::fs::create_dir_all(parent).at(parent)?;
     }
 
-    let temporary = temporary_path(path);
-    let mut file = File::create(&temporary).at(&temporary)?;
-    file.write_all(data).at(&temporary)?;
-    file.sync_all().at(&temporary)?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)).at(&temporary)?;
-    std::fs::rename(&temporary, path).at(path)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .at(path)?;
+    file.write_all(data).at(path)?;
+    file.sync_all().at(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).at(path)?;
     Ok(())
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
+fn temporary_path(path: &Path, transaction_id: &str) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("exposure");
-    path.with_file_name(format!(".{file_name}.pako-new"))
+    path.with_file_name(format!(".{file_name}.pako-{transaction_id}.new"))
 }
 
 fn exposure_receipt(kind: &str, path: &Path, data: &[u8]) -> ExposureReceipt {
