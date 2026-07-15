@@ -39,6 +39,22 @@ pub trait Registry: Send + Sync {
         destination: &Path,
     ) -> anyhow::Result<()>;
 
+    async fn fetch_blob_with_progress(
+        &self,
+        reference: &OciReference,
+        digest: Sha256Digest,
+        destination: &Path,
+        progress: &ProgressBar,
+    ) -> anyhow::Result<()>;
+
+    async fn fetch_blob_impl(
+        &self,
+        reference: &OciReference,
+        digest: Sha256Digest,
+        destination: &Path,
+        shared_progress: Option<&ProgressBar>,
+    ) -> anyhow::Result<()>;
+
     async fn push_blob(
         &self,
         reference: &OciReference,
@@ -208,6 +224,29 @@ impl Registry for OciClient {
         digest: Sha256Digest,
         destination: &Path,
     ) -> anyhow::Result<()> {
+        self.fetch_blob_impl(reference, digest, destination, None)
+            .await
+    }
+
+    /// Fetch a blob while contributing bytes to a caller-owned progress bar.
+    async fn fetch_blob_with_progress(
+        &self,
+        reference: &OciReference,
+        digest: Sha256Digest,
+        destination: &Path,
+        progress: &ProgressBar,
+    ) -> anyhow::Result<()> {
+        self.fetch_blob_impl(reference, digest, destination, Some(progress))
+            .await
+    }
+
+    async fn fetch_blob_impl(
+        &self,
+        reference: &OciReference,
+        digest: Sha256Digest,
+        destination: &Path,
+        shared_progress: Option<&ProgressBar>,
+    ) -> anyhow::Result<()> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -237,19 +276,26 @@ impl Registry for OciClient {
             .open(&partial)
             .await?;
         let content_length = response.content_length();
-        let progress = transfer_progress(
-            "downloading blob",
-            content_length.map(|length| if append { offset + length } else { length }),
-        );
+        let local_progress = shared_progress.is_none().then(|| {
+            transfer_progress(
+                "downloading blob",
+                content_length.map(|length| if append { offset + length } else { length }),
+            )
+        });
+        let progress = shared_progress.or(local_progress.as_ref());
         if append {
-            progress.set_position(offset);
+            if let Some(progress) = progress {
+                progress.inc(offset);
+            }
         }
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
-            progress.inc(chunk.len() as u64);
+            if let Some(progress) = progress {
+                progress.inc(chunk.len() as u64);
+            }
         }
         file.sync_all().await?;
         drop(file);
@@ -261,7 +307,9 @@ impl Registry for OciClient {
         }
 
         tokio::fs::rename(partial, destination).await?;
-        progress.finish_with_message("downloaded blob");
+        if let Some(progress) = local_progress {
+            progress.finish_with_message("downloaded blob");
+        }
         Ok(())
     }
 

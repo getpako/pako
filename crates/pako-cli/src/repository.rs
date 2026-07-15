@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, fs::File, path::PathBuf, str::FromStr};
+use std::{collections::BTreeSet, fs::File, path::PathBuf, str::FromStr, time::Duration};
+
+use futures_util::{stream, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use pako_core::{
     installer::{InstallRequest, Installer},
@@ -68,12 +71,14 @@ pub(crate) async fn install_remote(
         .find(|descriptor| descriptor.media_type == pako_core::manifest::PACK_INDEX_MEDIA_TYPE)
         .ok_or_else(|| anyhow::anyhow!("pack index layer is missing"))?;
 
+    let progress = download_progress(package_descriptor.size + index_descriptor.size);
     let (package_manifest, pack_index) = fetch_package_metadata(
         installer,
         &client,
         &platform_reference,
         package_descriptor,
         index_descriptor,
+        &progress,
     )
     .await?;
 
@@ -88,7 +93,9 @@ pub(crate) async fn install_remote(
         return Ok(());
     }
 
-    download_missing_chunks(installer, &client, &platform_reference, &plan).await?;
+    progress.set_length(progress.position() + plan.network_bytes);
+    download_missing_chunks(installer, &client, &platform_reference, &plan, &progress).await?;
+    progress.finish_with_message("downloaded package blobs");
 
     let request = InstallRequest {
         repository: repository.name,
@@ -169,18 +176,22 @@ async fn fetch_package_metadata(
     reference: &OciReference,
     package_descriptor: &pako_oci::Descriptor,
     index_descriptor: &pako_oci::Descriptor,
+    progress: &ProgressBar,
 ) -> anyhow::Result<(PackageManifest, PackIndex)> {
     let directory = installer.layout().cache.join("metadata");
     std::fs::create_dir_all(&directory)?;
 
     let package_path = directory.join(package_descriptor.digest.hex());
     let index_path = directory.join(index_descriptor.digest.hex());
-    client
-        .fetch_blob(reference, package_descriptor.digest, &package_path)
-        .await?;
-    client
-        .fetch_blob(reference, index_descriptor.digest, &index_path)
-        .await?;
+    tokio::try_join!(
+        client.fetch_blob_with_progress(
+            reference,
+            package_descriptor.digest,
+            &package_path,
+            progress,
+        ),
+        client.fetch_blob_with_progress(reference, index_descriptor.digest, &index_path, progress),
+    )?;
 
     let package_manifest = serde_json::from_reader(File::open(package_path)?)?;
     let pack_index = serde_json::from_reader(File::open(index_path)?)?;
@@ -207,16 +218,32 @@ async fn download_missing_chunks(
     client: &OciClient,
     reference: &OciReference,
     plan: &pako_core::planner::DownloadPlan,
+    progress: &ProgressBar,
 ) -> anyhow::Result<()> {
+    let jobs = std::thread::available_parallelism().map_or(1, usize::from);
+    let downloads = stream::iter(plan.packs.iter().cloned().map(|planned_pack| {
+        let pack_path = installer
+            .layout()
+            .packs()
+            .join(format!("{}.pakopack", planned_pack.digest.hex()));
+        async move {
+            client
+                .fetch_blob_with_progress(reference, planned_pack.digest, &pack_path, progress)
+                .await
+        }
+    }))
+    .buffer_unordered(jobs);
+
+    futures_util::pin_mut!(downloads);
+    while let Some(result) = downloads.next().await {
+        result?;
+    }
+
     for planned_pack in &plan.packs {
         let pack_path = installer
             .layout()
             .packs()
             .join(format!("{}.pakopack", planned_pack.digest.hex()));
-        client
-            .fetch_blob(reference, planned_pack.digest, &pack_path)
-            .await?;
-
         let mut reader = PackReader::open(&pack_path)?;
         for digest in &planned_pack.needed_chunks {
             let mut temporary = installer
@@ -228,6 +255,18 @@ async fn download_missing_chunks(
     }
 
     Ok(())
+}
+
+fn download_progress(total: u64) -> ProgressBar {
+    let progress = ProgressBar::new(total);
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} downloading package [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+    )
+    .expect("package download progress template is valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
 }
 
 fn print_plan(
