@@ -294,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             let artifact = std::fs::read(arguments.artifact.join("package-manifest.json"))?;
             let manifest: pako_core::PackageManifest = serde_json::from_slice(&artifact)?;
+            log::info!("updating signed TUF catalog");
             tuf::add_release(
                 &arguments.tuf,
                 manifest.package.clone(),

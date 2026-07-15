@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use indicatif::{ProgressBar, ProgressStyle};
+use log::info;
 use pako_core::{
     canonical,
     manifest::{PackIndex, PackageManifest, PACKAGE_MANIFEST_MEDIA_TYPE, PACK_INDEX_MEDIA_TYPE},
@@ -33,6 +35,7 @@ pub(crate) async fn publish(
         anyhow::bail!("publish reference must use a tag, not a digest");
     }
 
+    info!("loading and verifying publish artifact");
     let artifacts = Artifacts::load(artifact)?;
     let mut client = OciClient::new()?;
     if insecure_http {
@@ -44,10 +47,13 @@ pub(crate) async fn publish(
 
     let config = NamedTempFile::new()?;
     std::fs::write(config.path(), b"{}")?;
+    info!("uploading OCI configuration");
     let config_digest = client.push_blob(&reference, config.path()).await?;
 
+    info!("uploading package manifest");
     let package_digest =
         push_checked_blob(&client, &reference, &artifacts.package_manifest).await?;
+    info!("uploading pack index");
     let index_digest = push_checked_blob(&client, &reference, &artifacts.pack_index).await?;
     if package_digest != artifacts.package_manifest_digest
         || index_digest != artifacts.pack_index_digest
@@ -63,6 +69,8 @@ pub(crate) async fn publish(
         )?,
         descriptor(PACK_INDEX_MEDIA_TYPE, index_digest, &artifacts.pack_index)?,
     ];
+    let pack_count = artifacts.packs.len();
+    let progress = pack_progress("uploading packs", pack_count);
     for (digest, path) in &artifacts.packs {
         let uploaded = push_checked_blob(&client, &reference, path).await?;
         if uploaded != *digest {
@@ -72,7 +80,9 @@ pub(crate) async fn publish(
             );
         }
         layers.push(descriptor(PACK_MEDIA_TYPE, uploaded, path)?);
+        progress.inc(1);
     }
+    progress.finish_with_message(format!("uploaded {pack_count} packs"));
 
     let manifest = ImageManifest {
         schema_version: 2,
@@ -103,6 +113,7 @@ pub(crate) async fn publish(
     };
     let manifest_bytes = canonical::to_vec(&manifest)?;
     let manifest_digest = Sha256Digest::calculate(&manifest_bytes);
+    info!("publishing platform manifest");
     client
         .push_manifest(
             &reference.with_digest(manifest_digest),
@@ -141,6 +152,7 @@ pub(crate) async fn publish(
         ]),
     };
     let index_bytes = canonical::to_vec(&index)?;
+    info!("publishing OCI image index");
     client
         .push_manifest(&reference, OCI_IMAGE_INDEX_MEDIA_TYPE, &index_bytes)
         .await
@@ -178,6 +190,8 @@ impl Artifacts {
         if index.package_manifest_digest != package_manifest_digest {
             anyhow::bail!("pack index references a different package manifest");
         }
+        let pack_count = index.packs.len();
+        let progress = pack_progress("verifying packs", pack_count);
         let mut packs = BTreeMap::new();
         for (digest, descriptor) in &index.packs {
             let path = directory
@@ -191,7 +205,9 @@ impl Artifacts {
                 anyhow::bail!("pack digest does not match index: {}", path.display());
             }
             packs.insert(*digest, path);
+            progress.inc(1);
         }
+        progress.finish_with_message(format!("verified {pack_count} packs"));
         Ok(Self {
             manifest,
             package_manifest,
@@ -201,6 +217,19 @@ impl Artifacts {
             packs,
         })
     }
+}
+
+fn pack_progress(message: &str, pack_count: usize) -> ProgressBar {
+    let progress = ProgressBar::new(pack_count as u64);
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} packs ({per_sec})",
+    )
+    .expect("pack publish progress template is valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.set_message(message.to_owned());
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
+    progress
 }
 
 async fn push_checked_blob(
