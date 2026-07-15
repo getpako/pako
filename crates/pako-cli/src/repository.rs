@@ -1,4 +1,11 @@
-use std::{collections::BTreeSet, fs::File, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    fs::File,
+    path::PathBuf,
+    str::FromStr,
+    sync::Mutex,
+    time::Duration,
+};
 
 use futures_util::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,6 +20,8 @@ use pako_oci::{ImageIndex, ImageManifest, OciClient, OciReference, Registry};
 use pako_trust::TrustedRepository;
 use serde::Deserialize;
 use url::Url;
+
+use crate::output::confirm;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -41,6 +50,7 @@ pub(crate) async fn install_remote(
     package: &str,
     channel: &str,
     dry_run: bool,
+    confirm_before_download: bool,
 ) -> anyhow::Result<()> {
     let repository = RepositoryConfig::load(installer.layout())?;
     let catalog = refresh_catalog(installer, &repository).await?;
@@ -71,14 +81,14 @@ pub(crate) async fn install_remote(
         .find(|descriptor| descriptor.media_type == pako_core::manifest::PACK_INDEX_MEDIA_TYPE)
         .ok_or_else(|| anyhow::anyhow!("pack index layer is missing"))?;
 
-    let progress = download_progress(package_descriptor.size + index_descriptor.size);
+    let metadata_progress = ProgressBar::hidden();
     let (package_manifest, pack_index) = fetch_package_metadata(
         installer,
         &client,
         &platform_reference,
         package_descriptor,
         index_descriptor,
-        &progress,
+        &metadata_progress,
     )
     .await?;
 
@@ -93,6 +103,21 @@ pub(crate) async fn install_remote(
         return Ok(());
     }
 
+    if confirm_before_download {
+        let prompt = if plan.network_bytes == 0 {
+            "Install this package using the reusable local chunks?"
+        } else {
+            "Download the missing blobs and install this package?"
+        };
+        if !confirm(prompt)? {
+            println!("installation cancelled");
+            return Ok(());
+        }
+    }
+
+    let progress =
+        download_progress(package_descriptor.size + index_descriptor.size + plan.network_bytes);
+    progress.set_position(metadata_progress.position());
     progress.set_length(progress.position() + plan.network_bytes);
     download_missing_chunks(installer, &client, &platform_reference, &plan, &progress).await?;
     progress.finish_with_message("downloaded package blobs");
@@ -202,15 +227,48 @@ fn collect_available_chunks(
     installer: &Installer,
     index: &PackIndex,
 ) -> anyhow::Result<BTreeSet<pako_core::Sha256Digest>> {
-    let mut available = BTreeSet::new();
+    let digests = index.chunks.keys().copied().collect::<Vec<_>>();
+    let worker_count = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(digests.len().max(1));
+    let progress = item_progress("checking local chunks", digests.len(), "chunks");
+    let queue = Mutex::new(VecDeque::from(digests));
+    let results = Mutex::new(Vec::new());
 
-    for digest in index.chunks.keys() {
-        if installer.store().contains(*digest)? {
-            available.insert(*digest);
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let store = installer.store().clone();
+            let queue = &queue;
+            let results = &results;
+            let progress = progress.clone();
+            scope.spawn(move || loop {
+                let Some(digest) = queue
+                    .lock()
+                    .expect("chunk check queue lock poisoned")
+                    .pop_front()
+                else {
+                    return;
+                };
+                let result = store.contains(digest).map(|present| (digest, present));
+                progress.inc(1);
+                results
+                    .lock()
+                    .expect("chunk check result lock poisoned")
+                    .push(result);
+            });
         }
-    }
+    });
 
-    Ok(available)
+    let checked = results
+        .into_inner()
+        .expect("chunk check result lock poisoned")
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    progress.finish_with_message("checked local chunks");
+    Ok(checked
+        .into_iter()
+        .filter_map(|(digest, present)| present.then_some(digest))
+        .collect())
 }
 
 async fn download_missing_chunks(
@@ -269,18 +327,41 @@ fn download_progress(total: u64) -> ProgressBar {
     progress
 }
 
+fn item_progress(message: &str, total: usize, unit: &str) -> ProgressBar {
+    let progress = ProgressBar::new(total as u64);
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} {prefix} ({per_sec})",
+    )
+    .expect("item progress template is valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.set_prefix(unit.to_owned());
+    progress.set_message(message.to_owned());
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
+}
+
 fn print_plan(
     manifest: &PackageManifest,
     plan: &pako_core::planner::DownloadPlan,
     available_chunks: usize,
 ) {
+    let total_chunks = available_chunks + plan.missing_chunks.len();
     println!(
-        "{} {}-{}: download {}, reuse {} chunks",
-        manifest.package,
-        manifest.upstream_version,
-        manifest.release,
+        "package: {} {}-{}",
+        manifest.package, manifest.upstream_version, manifest.release
+    );
+    println!("target: {}", manifest.target);
+    println!(
+        "chunks: {total_chunks} total, {available_chunks} reusable locally, {} to download",
+        plan.missing_chunks.len()
+    );
+    println!(
+        "download: {} across {} pack(s); useful data {}, overfetch {}",
         format_size(plan.network_bytes),
-        available_chunks,
+        plan.packs.len(),
+        format_size(plan.required_raw_bytes),
+        format_size(plan.overfetch_bytes()),
     );
 }
 

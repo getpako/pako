@@ -18,10 +18,24 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Command::Install(arguments) => {
-            install_remote(&installer, &arguments.package, &arguments.channel, false).await?;
+            install_remote(
+                &installer,
+                &arguments.package,
+                &arguments.channel,
+                false,
+                true,
+            )
+            .await?;
         }
         Command::Upgrade(arguments) => {
-            install_remote(&installer, &arguments.package, "stable", arguments.dry_run).await?;
+            install_remote(
+                &installer,
+                &arguments.package,
+                "stable",
+                arguments.dry_run,
+                false,
+            )
+            .await?;
         }
         Command::Verify(arguments) => {
             let package = arguments.package;
