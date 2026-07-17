@@ -1,4 +1,6 @@
-use clap::{Args, Parser, Subcommand};
+use std::num::NonZeroUsize;
+
+use clap::{ArgAction, Args, Parser, Subcommand};
 
 const ROOT_LONG_ABOUT: &str = "\
 Pako is a user-space package manager for Linux.
@@ -184,10 +186,16 @@ Examples:
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {
-    /// Confirm destructive prompts without reading from standard input.
+    /// Increase diagnostic detail. Repeat for debug and trace output.
     ///
-    /// This currently applies to package removal. It has no effect on
-    /// read-only commands such as `list`, `status`, and `verify`.
+    /// Complete diagnostics are always written to the operation log.
+    #[arg(short, long, action = ArgAction::Count, global = true)]
+    pub(crate) verbose: u8,
+
+    /// Confirm planned changes without reading from standard input.
+    ///
+    /// This applies to install, upgrade, rollback, prune, and removal. It has
+    /// no effect on read-only commands such as `list`, `status`, and `verify`.
     #[arg(short = 'y', long, global = true)]
     pub(crate) yes: bool,
 
@@ -338,7 +346,7 @@ pub(crate) struct PruneArgs {
     pub(crate) package: String,
     /// Number of most recent history entries to retain.
     #[arg(long, value_name = "COUNT")]
-    pub(crate) keep: usize,
+    pub(crate) keep: NonZeroUsize,
 }
 
 /// Arguments accepted by `pako remove`.
@@ -357,6 +365,35 @@ pub(crate) struct StatusArgs {
     /// Omit this argument to display all installed packages.
     #[arg(value_name = "PACKAGE")]
     pub(crate) package: Option<String>,
+}
+
+impl Cli {
+    pub(crate) fn operation_log_name(&self) -> String {
+        let (operation, package) = match &self.command {
+            Command::Install(arguments) => ("install", Some(arguments.package.as_str())),
+            Command::Upgrade(arguments) => ("upgrade", Some(arguments.package.as_str())),
+            Command::Verify(arguments) => ("verify", Some(arguments.package.as_str())),
+            Command::Rollback(arguments) => ("rollback", Some(arguments.package.as_str())),
+            Command::Versions(arguments) => ("versions", Some(arguments.package.as_str())),
+            Command::Prune(arguments) => ("prune", Some(arguments.package.as_str())),
+            Command::Remove(arguments) => ("remove", Some(arguments.package.as_str())),
+            Command::List => ("list", None),
+            Command::Status(arguments) => ("status", arguments.package.as_deref()),
+            Command::Recover => ("recover", None),
+        };
+        package.map_or_else(|| operation.to_owned(), |package| format!("{operation}-{package}"))
+    }
+
+    pub(crate) fn mutates_package_state(&self) -> bool {
+        matches!(
+            &self.command,
+            Command::Install(_)
+                | Command::Upgrade(_)
+                | Command::Rollback(_)
+                | Command::Prune(_)
+                | Command::Remove(_)
+        )
+    }
 }
 
 #[cfg(test)]

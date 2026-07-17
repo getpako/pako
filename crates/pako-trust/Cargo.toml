@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
+log.workspace = true
 pako-core = { path = "../pako-core" }
 serde.workspace = true
 serde_json.workspace = true

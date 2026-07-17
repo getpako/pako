@@ -1,6 +1,5 @@
 mod archive;
 mod builder;
-mod logging;
 mod publisher;
 mod recipe;
 mod sandbox;
@@ -239,11 +238,37 @@ root, targets, snapshot, and timestamp metadata.",
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    logging::init(cli.verbose)?;
+impl Command {
+    fn log_name(&self) -> &'static str {
+        match self {
+            Self::Lint(_) => "lint",
+            Self::Build(_) => "build",
+            Self::Publish(_) => "publish",
+            Self::Tuf(_) => "tuf",
+        }
+    }
+}
 
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    let log_directory = PathBuf::from("logs");
+    let log = match pako_log::init(&log_directory, cli.command.log_name(), cli.verbose) {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("error: failed to initialize logging: {error:#}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = run(cli).await {
+        log::error!("{error:#}");
+        eprintln!("details: {}", log.path().display());
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Lint(arguments) => {
             log::info!("validating recipe {}", arguments.recipe.display());

@@ -4,26 +4,27 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::Mutex,
-    time::Duration,
 };
 
 use futures_util::{stream, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 
 use pako_core::{
     installer::{InstallRequest, Installer},
-    manifest::{PackIndex, PackageManifest},
+    manifest::{Entry, PackIndex, PackageManifest},
     pack::PackReader,
     planner,
+    receipt::{PackageState, Receipt},
+    Sha256Digest,
 };
 use pako_oci::{ImageIndex, ImageManifest, OciClient, OciReference, Registry};
 use pako_trust::TrustedRepository;
 use serde::Deserialize;
 use url::Url;
 
-use crate::output::confirm;
+use crate::output::Ui;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RepositoryConfig {
     name: String,
@@ -47,18 +48,79 @@ impl RepositoryConfig {
     }
 }
 
-pub(crate) async fn install_remote(
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PackageOperation {
+    Install,
+    Upgrade,
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteInstallPlan {
+    pub(crate) operation: PackageOperation,
+    pub(crate) repository: String,
+    pub(crate) channel: String,
+    pub(crate) target: String,
+    pub(crate) manifest: PackageManifest,
+    pub(crate) download: planner::DownloadPlan,
+    pub(crate) available_chunks: usize,
+    pub(crate) total_chunks: usize,
+    pub(crate) reusable_bytes: u64,
+    pub(crate) installed_bytes: u64,
+    pub(crate) current_version: Option<String>,
+    pub(crate) up_to_date: bool,
+    pub(crate) launcher_count: usize,
+    pub(crate) desktop_entry_count: usize,
+    pub(crate) icon_count: usize,
+    client: OciClient,
+    platform_reference: OciReference,
+    pack_index: PackIndex,
+    platform_digest: Sha256Digest,
+    package_manifest_digest: Sha256Digest,
+    pack_index_digest: Sha256Digest,
+}
+
+impl RemoteInstallPlan {
+    pub(crate) fn version(&self) -> String {
+        format!("{}-{}", self.manifest.upstream_version, self.manifest.release)
+    }
+
+    pub(crate) fn cache_growth(&self) -> u64 {
+        self.download
+            .network_bytes
+            .saturating_add(self.download.required_raw_bytes)
+    }
+
+    pub(crate) fn data_growth(&self) -> u64 {
+        self.installed_bytes
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum InstallOutcome {
+    Installed(Receipt),
+    AlreadyCurrent,
+}
+
+pub(crate) async fn resolve_remote(
     installer: &Installer,
     package: &str,
     channel: &str,
-    dry_run: bool,
-    confirm_before_download: bool,
-) -> anyhow::Result<()> {
+    operation: PackageOperation,
+    ui: Ui,
+) -> anyhow::Result<RemoteInstallPlan> {
+    pako_core::path::validate_channel(channel)?;
     let repository = RepositoryConfig::load(installer.layout())?;
+    log::info!(
+        "resolving {package} from repository {} channel {channel}",
+        repository.name
+    );
+
+    let catalog_step = ui.spinner("Refreshing trusted repository metadata");
     let catalog = refresh_catalog(installer, &repository).await?;
+    catalog_step.finish("Repository metadata verified");
+
     let target = host_target()?;
     let release = catalog.resolve(package, &target, channel)?;
-
     let index_reference =
         OciReference::from_str(&release.oci)?.with_digest(release.manifest_digest);
     let mut client = OciClient::new()?;
@@ -66,10 +128,11 @@ pub(crate) async fn install_remote(
         ensure_loopback_registry(&index_reference.registry)?;
         client = client.insecure_http();
     }
+
+    let package_step = ui.spinner("Resolving package metadata");
     let platform = resolve_platform(&client, &index_reference, &target).await?;
     let platform_reference = index_reference.with_digest(platform.digest);
     let oci_manifest = fetch_image_manifest(&client, &platform_reference).await?;
-
     let package_descriptor = oci_manifest
         .layers
         .iter()
@@ -82,62 +145,112 @@ pub(crate) async fn install_remote(
         .iter()
         .find(|descriptor| descriptor.media_type == pako_core::manifest::PACK_INDEX_MEDIA_TYPE)
         .ok_or_else(|| anyhow::anyhow!("pack index layer is missing"))?;
-
-    let metadata_progress = ProgressBar::hidden();
-    let (package_manifest, pack_index) = fetch_package_metadata(
+    let (manifest, pack_index) = fetch_package_metadata(
         installer,
         &client,
         &platform_reference,
         package_descriptor,
         index_descriptor,
-        &metadata_progress,
     )
     .await?;
+    manifest.validate()?;
+    pack_index.validate_against(&manifest)?;
+    package_step.finish("Package metadata verified");
 
-    package_manifest.validate()?;
-    pack_index.validate_against(&package_manifest)?;
+    let available = collect_available_chunks(installer, &pack_index, ui)?;
+    let download = planner::plan(&pack_index, &available)?;
+    let total_raw_bytes = pack_index
+        .chunks
+        .values()
+        .try_fold(0_u64, |total, location| total.checked_add(location.raw_size))
+        .ok_or_else(|| anyhow::anyhow!("package chunk size overflow"))?;
+    let installed_bytes = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::File { size, .. } => Some(*size),
+            Entry::Directory { .. } | Entry::Symlink { .. } => None,
+        })
+        .try_fold(0_u64, |total, size| total.checked_add(size))
+        .ok_or_else(|| anyhow::anyhow!("installed size overflow"))?;
 
-    let available = collect_available_chunks(installer, &pack_index)?;
-    let plan = planner::plan(&pack_index, &available)?;
-    print_plan(&package_manifest, &plan, available.len());
+    let state_path = installer.layout().package_state(package)?;
+    let current = if state_path.exists() {
+        let state = PackageState::load(&state_path)?;
+        let receipt = Receipt::load(
+            &installer
+                .layout()
+                .version_record(package, &state.active)?,
+        )?;
+        Some((state, receipt))
+    } else {
+        None
+    };
+    let current_version = current.as_ref().map(|(state, _)| state.active.clone());
+    let up_to_date = current
+        .as_ref()
+        .is_some_and(|(_, receipt)| receipt.oci_manifest_digest == platform.digest);
 
-    if dry_run {
-        return Ok(());
-    }
-
-    if confirm_before_download {
-        let prompt = if plan.network_bytes == 0 {
-            "Install this package using the reusable local chunks?"
-        } else {
-            "Download the missing blobs and install this package?"
-        };
-        if !confirm(prompt)? {
-            println!("installation cancelled");
-            return Ok(());
-        }
-    }
-
-    let progress =
-        download_progress(package_descriptor.size + index_descriptor.size + plan.network_bytes);
-    progress.set_position(metadata_progress.position());
-    progress.set_length(progress.position() + plan.network_bytes);
-    download_missing_chunks(installer, &client, &platform_reference, &plan, &progress).await?;
-    progress.finish_with_message("downloaded package blobs");
-
-    let request = InstallRequest {
+    Ok(RemoteInstallPlan {
+        operation,
         repository: repository.name,
-        oci_manifest_digest: platform.digest,
+        channel: channel.to_owned(),
+        target,
+        launcher_count: manifest.integrations.launchers.len(),
+        desktop_entry_count: manifest.integrations.desktop_entries.len(),
+        icon_count: manifest.integrations.icons.len(),
+        total_chunks: pack_index.chunks.len(),
+        available_chunks: available.len(),
+        reusable_bytes: total_raw_bytes.saturating_sub(download.required_raw_bytes),
+        installed_bytes,
+        current_version,
+        up_to_date,
+        manifest,
+        download,
+        client,
+        platform_reference,
+        pack_index,
+        platform_digest: platform.digest,
         package_manifest_digest: package_descriptor.digest,
         pack_index_digest: index_descriptor.digest,
-        channel: channel.to_owned(),
-    };
-    let receipt = installer.install(&package_manifest, &pack_index, &request)?;
+    })
+}
 
-    println!(
-        "installed {} {}-{}",
-        receipt.package, receipt.upstream_version, receipt.release
-    );
-    Ok(())
+pub(crate) async fn execute_remote(
+    installer: &Installer,
+    plan: RemoteInstallPlan,
+    ui: Ui,
+) -> anyhow::Result<InstallOutcome> {
+    if plan.up_to_date {
+        return Ok(InstallOutcome::AlreadyCurrent);
+    }
+
+    if plan.download.network_bytes > 0 {
+        let progress = ui.byte_progress("Downloading package data", plan.download.network_bytes);
+        download_missing_chunks(
+            installer,
+            &plan.client,
+            &plan.platform_reference,
+            &plan.download,
+            &progress,
+        )
+        .await?;
+        progress.finish_with_message("Downloaded package data");
+    } else {
+        log::info!("all required chunks are already available locally");
+    }
+
+    let step = ui.spinner("Materializing and verifying package");
+    let request = InstallRequest {
+        repository: plan.repository,
+        oci_manifest_digest: plan.platform_digest,
+        package_manifest_digest: plan.package_manifest_digest,
+        pack_index_digest: plan.pack_index_digest,
+        channel: plan.channel,
+    };
+    let receipt = installer.install(&plan.manifest, &plan.pack_index, &request)?;
+    step.finish("Package materialized, verified, and activated");
+    Ok(InstallOutcome::Installed(receipt))
 }
 
 fn ensure_loopback_registry(registry: &str) -> anyhow::Result<()> {
@@ -203,7 +316,6 @@ async fn fetch_package_metadata(
     reference: &OciReference,
     package_descriptor: &pako_oci::Descriptor,
     index_descriptor: &pako_oci::Descriptor,
-    progress: &ProgressBar,
 ) -> anyhow::Result<(PackageManifest, PackIndex)> {
     let directory = installer.layout().cache.join("metadata");
     std::fs::create_dir_all(&directory)?;
@@ -211,13 +323,8 @@ async fn fetch_package_metadata(
     let package_path = directory.join(package_descriptor.digest.hex());
     let index_path = directory.join(index_descriptor.digest.hex());
     tokio::try_join!(
-        client.fetch_blob_with_progress(
-            reference,
-            package_descriptor.digest,
-            &package_path,
-            progress,
-        ),
-        client.fetch_blob_with_progress(reference, index_descriptor.digest, &index_path, progress),
+        client.fetch_blob(reference, package_descriptor.digest, &package_path),
+        client.fetch_blob(reference, index_descriptor.digest, &index_path),
     )?;
 
     let package_manifest = serde_json::from_reader(File::open(package_path)?)?;
@@ -228,12 +335,13 @@ async fn fetch_package_metadata(
 fn collect_available_chunks(
     installer: &Installer,
     index: &PackIndex,
-) -> anyhow::Result<BTreeSet<pako_core::Sha256Digest>> {
+    ui: Ui,
+) -> anyhow::Result<BTreeSet<Sha256Digest>> {
     let digests = index.chunks.keys().copied().collect::<Vec<_>>();
     let worker_count = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(digests.len().max(1));
-    let progress = item_progress("checking local chunks", digests.len(), "chunks");
+    let progress = ui.item_progress("Checking local chunk cache", digests.len(), "chunks");
     let queue = Mutex::new(VecDeque::from(digests));
     let results = Mutex::new(Vec::new());
 
@@ -266,7 +374,7 @@ fn collect_available_chunks(
         .expect("chunk check result lock poisoned")
         .into_iter()
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    progress.finish_with_message("checked local chunks");
+    progress.finish_with_message("Checked local chunk cache");
     Ok(checked
         .into_iter()
         .filter_map(|(digest, present)| present.then_some(digest))
@@ -277,7 +385,7 @@ async fn download_missing_chunks(
     installer: &Installer,
     client: &OciClient,
     reference: &OciReference,
-    plan: &pako_core::planner::DownloadPlan,
+    plan: &planner::DownloadPlan,
     progress: &ProgressBar,
 ) -> anyhow::Result<()> {
     let jobs = std::thread::available_parallelism().map_or(1, usize::from);
@@ -317,78 +425,6 @@ async fn download_missing_chunks(
     Ok(())
 }
 
-fn download_progress(total: u64) -> ProgressBar {
-    let progress = ProgressBar::new(total);
-    let style = ProgressStyle::with_template(
-        "{spinner:.green} downloading package [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-    )
-    .expect("package download progress template is valid")
-    .progress_chars("#>-");
-    progress.set_style(style);
-    progress.enable_steady_tick(Duration::from_millis(100));
-    progress
-}
-
-fn item_progress(message: &str, total: usize, unit: &str) -> ProgressBar {
-    let progress = ProgressBar::new(total as u64);
-    let style = ProgressStyle::with_template(
-        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} {prefix} ({per_sec})",
-    )
-    .expect("item progress template is valid")
-    .progress_chars("#>-");
-    progress.set_style(style);
-    progress.set_prefix(unit.to_owned());
-    progress.set_message(message.to_owned());
-    progress.enable_steady_tick(Duration::from_millis(100));
-    progress
-}
-
-fn print_plan(
-    manifest: &PackageManifest,
-    plan: &pako_core::planner::DownloadPlan,
-    available_chunks: usize,
-) {
-    let total_chunks = available_chunks + plan.missing_chunks.len();
-    println!(
-        "package: {} {}-{}",
-        manifest.package, manifest.upstream_version, manifest.release
-    );
-    println!("target: {}", manifest.target);
-    println!(
-        "chunks: {total_chunks} total, {available_chunks} reusable locally, {} to download",
-        plan.missing_chunks.len()
-    );
-    println!(
-        "download: {} across {} pack(s); useful data {}, overfetch {}",
-        format_size(plan.network_bytes),
-        plan.packs.len(),
-        format_size(plan.required_raw_bytes),
-        format_size(plan.overfetch_bytes()),
-    );
-}
-
-fn format_size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-
-    if bytes >= GIB {
-        format_scaled_size(bytes, GIB, "GiB")
-    } else if bytes >= MIB {
-        format_scaled_size(bytes, MIB, "MiB")
-    } else if bytes >= KIB {
-        format_scaled_size(bytes, KIB, "KiB")
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_scaled_size(bytes: u64, unit: u64, suffix: &str) -> String {
-    let whole = bytes / unit;
-    let tenths = (bytes % unit) * 10 / unit;
-    format!("{whole}.{tenths} {suffix}")
-}
-
 fn host_target() -> anyhow::Result<String> {
     let architecture = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
@@ -409,7 +445,7 @@ fn normalize_architecture(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_loopback_registry, format_size};
+    use super::ensure_loopback_registry;
 
     #[test]
     fn insecure_http_is_limited_to_loopback_registries() {
@@ -417,13 +453,5 @@ mod tests {
             assert!(ensure_loopback_registry(registry).is_ok());
         }
         assert!(ensure_loopback_registry("registry.example.com").is_err());
-    }
-
-    #[test]
-    fn download_sizes_use_appropriate_units() {
-        assert_eq!(format_size(512), "512 B");
-        assert_eq!(format_size(2 * 1024), "2.0 KiB");
-        assert_eq!(format_size(3 * 1024 * 1024), "3.0 MiB");
-        assert_eq!(format_size(4 * 1024 * 1024 * 1024), "4.0 GiB");
     }
 }

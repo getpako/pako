@@ -60,6 +60,13 @@ impl Installer {
     ) -> Result<Receipt> {
         manifest.validate()?;
         index.validate_against(manifest)?;
+        log::info!(
+            "installing {} {}-{} for {}",
+            manifest.package,
+            manifest.upstream_version,
+            manifest.release,
+            manifest.target
+        );
 
         let _lock = PackageLock::acquire(&self.layout, &manifest.package)?;
         let version = package_version(manifest);
@@ -83,9 +90,11 @@ impl Installer {
         );
         journal.save(&self.layout)?;
 
+        log::debug!("materializing package tree at {}", staging.display());
         materialize::materialize(manifest, &self.store, &staging)?;
         journal.advance(&self.layout, Phase::Materialized)?;
 
+        log::debug!("verifying staged package tree");
         verify::verify_tree(manifest, &staging)?;
         journal.advance(&self.layout, Phase::Verified)?;
 
@@ -160,6 +169,7 @@ impl Installer {
         journal.recovery = RecoveryAction::RollForward;
         journal.advance(&self.layout, Phase::Committing)?;
 
+        log::debug!("activating package tree at {}", final_path.display());
         activate_symlink(&final_path, &current_link)?;
         exposures.commit()?;
         receipt.save_atomic(&self.layout.version_record(&manifest.package, &version)?)?;

@@ -121,6 +121,11 @@ impl TrustedRepository {
     }
 
     pub async fn refresh_catalog(&self) -> anyhow::Result<ReleaseCatalog> {
+        log::debug!(
+            "refreshing TUF metadata from {} with targets {}",
+            self.metadata_url,
+            self.targets_url
+        );
         tokio::fs::create_dir_all(&self.datastore).await?;
         let trusted_root = tokio::fs::read(&self.root).await?;
 
@@ -140,6 +145,7 @@ impl TrustedRepository {
         let bytes = stream.into_vec().await?;
         let catalog: ReleaseCatalog = serde_json::from_slice(&bytes)?;
         catalog.validate()?;
+        log::debug!("loaded {} package(s) from signed catalog", catalog.packages.len());
         Ok(catalog)
     }
 }

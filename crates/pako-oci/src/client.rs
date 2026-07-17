@@ -140,6 +140,7 @@ impl OciClient {
         request: reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::Response> {
         let response = request.send().await?;
+        log::trace!("registry response status {}", response.status());
         if response.status().is_success() {
             return Ok(response);
         }
@@ -259,6 +260,7 @@ impl Registry for OciClient {
         let mut request = self.authenticate(self.client.get(url));
 
         if offset > 0 {
+            log::debug!("resuming blob {digest} at byte {offset}");
             request = request.header(RANGE, format!("bytes={offset}-"));
         }
 
@@ -307,6 +309,7 @@ impl Registry for OciClient {
         }
 
         tokio::fs::rename(partial, destination).await?;
+        log::debug!("verified downloaded blob {digest}");
         if let Some(progress) = local_progress {
             progress.finish_with_message("downloaded blob");
         }

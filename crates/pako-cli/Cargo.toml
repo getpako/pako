@@ -15,8 +15,12 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+walkdir.workspace = true
+fs2.workspace = true
 indicatif.workspace = true
+log.workspace = true
 pako-core = { path = "../pako-core" }
+pako-log = { path = "../pako-log" }
 pako-oci = { path = "../pako-oci" }
 pako-trust = { path = "../pako-trust" }
 serde.workspace = true

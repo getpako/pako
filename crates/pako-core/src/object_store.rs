@@ -43,6 +43,7 @@ impl ObjectStore {
             return Ok(true);
         }
 
+        log::warn!("removing corrupted cached object {}", path.display());
         std::fs::remove_file(&path).at(&path)?;
         Ok(false)
     }
@@ -60,6 +61,7 @@ impl ObjectStore {
     pub fn import(&self, mut reader: impl Read, expected: Sha256Digest) -> Result<PathBuf> {
         let destination = self.path(expected);
         if self.contains(expected)? {
+            log::trace!("object {expected} is already present");
             return Ok(destination);
         }
 

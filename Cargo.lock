@@ -1161,6 +1161,7 @@ dependencies = [
  "jiff",
  "log",
  "pako-core",
+ "pako-log",
  "pako-oci",
  "reqwest 0.12.28",
  "ring",
@@ -1183,15 +1184,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "fs2",
  "futures-util",
  "indicatif",
+ "log",
  "pako-core",
+ "pako-log",
  "pako-oci",
  "pako-trust",
  "serde",
  "serde_json",
  "tokio",
  "url",
+ "walkdir",
 ]
 
 [[package]]
@@ -1202,6 +1207,7 @@ dependencies = [
  "directories",
  "fs2",
  "hex",
+ "log",
  "pako-test-support",
  "semver",
  "serde",
@@ -1214,6 +1220,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pako-log"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+]
+
+[[package]]
 name = "pako-oci"
 version = "0.1.0"
 dependencies = [
@@ -1223,6 +1237,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "indicatif",
+ "log",
  "pako-core",
  "reqwest 0.12.28",
  "serde",
@@ -1246,6 +1261,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "log",
  "pako-core",
  "serde",
  "serde_json",
