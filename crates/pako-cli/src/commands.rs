@@ -15,6 +15,7 @@ use crate::{
     },
 };
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
     let layout = Layout::discover()?;
     layout.ensure()?;
@@ -199,6 +200,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn install_or_upgrade(
     installer: &Installer,
     layout: &Layout,

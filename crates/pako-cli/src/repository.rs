@@ -100,10 +100,11 @@ impl RemoteInstallPlan {
 
 #[derive(Debug)]
 pub(crate) enum InstallOutcome {
-    Installed(Receipt),
+    Installed(Box<Receipt>),
     AlreadyCurrent,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn resolve_remote(
     installer: &Installer,
     package: &str,
@@ -190,7 +191,7 @@ pub(crate) async fn resolve_remote(
             Entry::File { size, .. } => Some(*size),
             Entry::Directory { .. } | Entry::Symlink { .. } => None,
         })
-        .try_fold(0_u64, |total, size| total.checked_add(size))
+        .try_fold(0_u64, u64::checked_add)
         .ok_or_else(|| anyhow::anyhow!("installed size overflow"))?;
 
     let state_path = installer.layout().package_state(package)?;
@@ -246,7 +247,9 @@ pub(crate) async fn execute_remote(
         return Ok(InstallOutcome::AlreadyCurrent);
     }
 
-    if !plan.download.missing_chunks.is_empty() {
+    if plan.download.missing_chunks.is_empty() {
+        log::info!("all required chunks are already available locally");
+    } else {
         let progress = if plan.download.network_bytes > 0 {
             ui.byte_progress("Downloading package data", plan.download.network_bytes)
         } else {
@@ -266,8 +269,6 @@ pub(crate) async fn execute_remote(
         if plan.download.network_bytes > 0 {
             progress.finish_with_message("Downloaded package data");
         }
-    } else {
-        log::info!("all required chunks are already available locally");
     }
 
     let step = ui.spinner("Materializing and verifying package");
@@ -286,7 +287,7 @@ pub(crate) async fn execute_remote(
     })
     .await??;
     step.finish("Package materialized, verified, and activated");
-    Ok(InstallOutcome::Installed(receipt))
+    Ok(InstallOutcome::Installed(Box::new(receipt)))
 }
 
 fn ensure_loopback_registry(registry: &str) -> anyhow::Result<()> {
@@ -540,6 +541,7 @@ fn collect_cached_packs(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_missing_chunks(
     installer: &Installer,
     client: &OciClient,
@@ -601,17 +603,18 @@ async fn download_missing_chunks(
     let store = installer.store().clone();
     let packs_root_for_extract = packs_root.clone();
     tokio::task::spawn_blocking(move || {
-        extract_packs_parallel(packs, packs_root_for_extract, store, cpu_jobs, import_progress)
+        extract_packs_parallel(packs, &packs_root_for_extract, &store, cpu_jobs, import_progress)
     })
     .await??;
 
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn extract_packs_parallel(
     packs: Vec<planner::PlannedPack>,
-    packs_root: PathBuf,
-    store: pako_core::object_store::ObjectStore,
+    packs_root: &PathBuf,
+    store: &pako_core::object_store::ObjectStore,
     jobs: usize,
     progress: ProgressBar,
 ) -> anyhow::Result<()> {

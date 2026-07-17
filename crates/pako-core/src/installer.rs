@@ -62,6 +62,7 @@ impl Installer {
     ///
     /// The caller is responsible for downloading and importing all required
     /// chunks. This method performs only local transactional work.
+    #[allow(clippy::too_many_lines)]
     pub fn install(
         &self,
         manifest: &PackageManifest,

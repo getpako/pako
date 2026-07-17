@@ -10,6 +10,7 @@ pub(crate) struct Ui {
     assume_yes: bool,
 }
 
+#[allow(clippy::unused_self)]
 impl Ui {
     pub(crate) fn new(assume_yes: bool) -> Self {
         Self { assume_yes }
@@ -122,11 +123,7 @@ impl Step {
         log::info!(target: "pako.ui", "{message} in {}", format_duration(elapsed));
     }
 
-    pub(crate) fn abandon(self, message: impl Into<String>) {
-        let message = message.into();
-        self.progress.abandon_with_message(message.clone());
-        log::warn!("{message}");
-    }
+
 }
 
 pub(crate) fn format_size(bytes: u64) -> String {
