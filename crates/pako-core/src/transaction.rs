@@ -194,8 +194,13 @@ fn validate_journal(layout: &Layout, journal: &Journal) -> Result<()> {
                 "journal receipt has another active path".into(),
             ));
         }
-        if commit.receipt.exposures.len() != commit.exposures.len()
-            || !commit.exposures.iter().all(|prepared| {
+        let published = commit
+            .exposures
+            .iter()
+            .filter(|prepared| !prepared.remove)
+            .collect::<Vec<_>>();
+        if commit.receipt.exposures.len() != published.len()
+            || !published.iter().all(|prepared| {
                 commit.receipt.exposures.iter().any(|receipt| {
                     receipt.kind == prepared.receipt.kind
                         && receipt.path == prepared.receipt.path
@@ -209,7 +214,20 @@ fn validate_journal(layout: &Layout, journal: &Journal) -> Result<()> {
         }
         for exposure in &commit.exposures {
             ensure_exposure_path(layout, Path::new(&exposure.receipt.path))?;
-            ensure_exposure_path(layout, Path::new(&exposure.temporary))?;
+            if !exposure.temporary.is_empty() {
+                ensure_exposure_path(layout, Path::new(&exposure.temporary))?;
+            }
+            if let Some(backup) = &exposure.backup {
+                ensure_exposure_path(layout, Path::new(backup))?;
+            }
+            if let Some(previous) = &exposure.previous {
+                ensure_exposure_path(layout, Path::new(&previous.path))?;
+                if previous.path != exposure.receipt.path {
+                    return Err(Error::Transaction(
+                        "journal exposure backup has another destination".into(),
+                    ));
+                }
+            }
         }
     } else if journal.recovery == RecoveryAction::RollForward {
         return Err(Error::Transaction(
@@ -299,7 +317,8 @@ fn recover_roll_forward(
         .save_atomic(&layout.version_record(&journal.package, &commit.state.active)?)?;
     commit
         .state
-        .save_atomic(&layout.package_state(&journal.package)?)
+        .save_atomic(&layout.package_state(&journal.package)?)?;
+    integrations::ExposureTransaction::recover_finalize(layout, &commit.exposures)
 }
 
 /// Atomically replace the active-version symlink.
@@ -417,6 +436,9 @@ mod tests {
                     path: path.display().to_string(),
                     digest,
                 },
+                previous: None,
+                backup: None,
+                remove: false,
             }],
         });
         journal.save(&layout).unwrap();

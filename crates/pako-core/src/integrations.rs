@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::Write,
     os::unix::fs::PermissionsExt,
@@ -15,14 +16,22 @@ use crate::{
     Error, Result, Sha256Digest,
 };
 
-/// An exposure written under a private name, ready to be published during the
-/// transaction commit. Keeping this plan in the journal makes publication
-/// idempotent during recovery.
+/// An exposure prepared under private sibling paths.
+///
+/// `temporary` contains the new contents for create/replace actions. `backup`
+/// preserves the previous package-owned contents until the transaction is
+/// durable. Removal actions set `remove` and carry the previous receipt.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedExposure {
     pub temporary: String,
     pub receipt: ExposureReceipt,
+    #[serde(default)]
+    pub previous: Option<ExposureReceipt>,
+    #[serde(default)]
+    pub backup: Option<String>,
+    #[serde(default)]
+    pub remove: bool,
 }
 
 #[derive(Debug)]
@@ -31,6 +40,8 @@ struct PlannedExposure {
     path: PathBuf,
     data: Vec<u8>,
     mode: u32,
+    previous: Option<ExposureReceipt>,
+    remove: bool,
 }
 
 /// Serializes all package integrations. Package locks cannot prevent two
@@ -64,13 +75,15 @@ impl ExposureTransaction {
         })
     }
 
-    /// Calculate every destination and reject every conflict before touching
-    /// the filesystem outside the package tree.
+    /// Calculate every destination and reject conflicts before touching paths
+    /// outside the package tree. Existing files may only be replaced when they
+    /// still match a receipt owned by the package being upgraded.
     pub fn preflight(
         &mut self,
         manifest: &PackageManifest,
         layout: &Layout,
         tree: &Path,
+        previous_receipts: &[ExposureReceipt],
     ) -> Result<()> {
         let mut planned = Vec::new();
 
@@ -82,6 +95,8 @@ impl ExposureTransaction {
                 path,
                 data: content.into_bytes(),
                 mode: 0o755,
+                previous: None,
+                remove: false,
             });
         }
         for desktop_entry in &manifest.integrations.desktop_entries {
@@ -94,58 +109,139 @@ impl ExposureTransaction {
                 path,
                 data: content.into_bytes(),
                 mode: 0o644,
+                previous: None,
+                remove: false,
             });
         }
         for icon in &manifest.integrations.icons {
             let (directory, extension) = icon_destination(icon, layout)?;
             let path = directory.join(format!("{}.{}", icon.name, extension));
-            let source = tree.join(icon.source.as_str());
+            let source = icon.source.join_to(tree);
             planned.push(PlannedExposure {
                 kind: "icon",
                 path,
                 data: std::fs::read(&source).at(&source)?,
                 mode: 0o644,
+                previous: None,
+                remove: false,
             });
         }
 
-        for plan in &planned {
-            ensure_available(&plan.path)?;
+        let mut destinations = BTreeSet::new();
+        for plan in &mut planned {
+            if !destinations.insert(plan.path.clone()) {
+                return Err(Error::InvalidManifest(format!(
+                    "duplicate integration destination: {}",
+                    plan.path.display()
+                )));
+            }
+
+            let previous = previous_receipts
+                .iter()
+                .find(|receipt| Path::new(&receipt.path) == plan.path.as_path())
+                .cloned();
+            validate_existing_destination(&plan.path, previous.as_ref())?;
+            plan.previous = previous.filter(|_| plan.path.exists());
             ensure_available(&temporary_path(&plan.path, &self.transaction_id))?;
+            ensure_available(&backup_path(&plan.path, &self.transaction_id))?;
         }
+
+        for receipt in previous_receipts {
+            let path = PathBuf::from(&receipt.path);
+            if destinations.contains(&path) {
+                continue;
+            }
+            validate_existing_destination(&path, Some(receipt))?;
+            if path.exists() {
+                planned.push(PlannedExposure {
+                    kind: "removed",
+                    path,
+                    data: Vec::new(),
+                    mode: 0,
+                    previous: Some(receipt.clone()),
+                    remove: true,
+                });
+            }
+        }
+
         self.planned = planned;
         Ok(())
     }
 
-    /// Write every artifact to its private temporary name.
+    /// Write new artifacts and durable rollback copies under private names.
     pub fn prepare(&mut self) -> Result<&[PreparedExposure]> {
         for plan in &self.planned {
             let temporary = temporary_path(&plan.path, &self.transaction_id);
-            if let Err(error) = write_exposure(&temporary, &plan.data, plan.mode) {
-                self.rollback();
-                return Err(error);
+            let backup = plan
+                .previous
+                .as_ref()
+                .map(|_| backup_path(&plan.path, &self.transaction_id));
+
+            if let Some(backup) = &backup {
+                if let Err(error) = std::fs::hard_link(&plan.path, backup).at(backup) {
+                    let _ = self.rollback();
+                    return Err(error);
+                }
             }
+
+            if !plan.remove {
+                if let Err(error) = write_exposure(&temporary, &plan.data, plan.mode) {
+                    if let Some(backup) = &backup {
+                        let _ = remove_file_if_present(backup);
+                    }
+                    let _ = self.rollback();
+                    return Err(error);
+                }
+            }
+
             self.prepared.push(PreparedExposure {
                 temporary: temporary.display().to_string(),
-                receipt: exposure_receipt(plan.kind, &plan.path, &plan.data),
+                receipt: if plan.remove {
+                    plan.previous
+                        .clone()
+                        .expect("removal plans always have a previous receipt")
+                } else {
+                    exposure_receipt(plan.kind, &plan.path, &plan.data)
+                },
+                previous: plan.previous.clone(),
+                backup: backup.map(|path| path.display().to_string()),
+                remove: plan.remove,
             });
         }
         Ok(&self.prepared)
     }
 
-    /// Publish the preflighted files while the global exposure lock is held.
+    /// Publish the prepared create, replace, and remove actions while the
+    /// global exposure lock is held. Backups remain until `finalize`.
     pub fn commit(&mut self) -> Result<()> {
         publish(&self.prepared)
     }
 
-    /// Remove only temporary files created by this transaction. Published
-    /// files are intentionally retained for roll-forward recovery.
-    pub fn rollback(&mut self) {
-        cleanup_prepared(&self.prepared);
+    /// Restore package-owned files from backups and remove newly-created files.
+    pub fn rollback(&mut self) -> Result<()> {
+        rollback_prepared(&self.prepared)?;
         self.prepared.clear();
+        Ok(())
+    }
+
+    /// Delete private temporary and backup paths after the package state is
+    /// durable. This operation is idempotent and safe during roll-forward.
+    pub fn finalize(&mut self) -> Result<()> {
+        finalize_prepared(&self.prepared)?;
+        self.prepared.clear();
+        Ok(())
     }
 
     pub fn prepared(&self) -> &[PreparedExposure] {
         &self.prepared
+    }
+
+    pub fn published_receipts(&self) -> Vec<ExposureReceipt> {
+        self.prepared
+            .iter()
+            .filter(|exposure| !exposure.remove)
+            .map(|exposure| exposure.receipt.clone())
+            .collect()
     }
 
     /// Recovery gets the same global lock before idempotently completing a
@@ -156,52 +252,109 @@ impl ExposureTransaction {
         transaction.commit()
     }
 
+    pub fn recover_finalize(layout: &Layout, prepared: &[PreparedExposure]) -> Result<()> {
+        let mut transaction = Self::begin(layout, "recovery")?;
+        transaction.prepared = prepared.to_vec();
+        transaction.finalize()
+    }
+
     pub fn recover_rollback(layout: &Layout, prepared: &[PreparedExposure]) -> Result<()> {
         let mut transaction = Self::begin(layout, "recovery")?;
         transaction.prepared = prepared.to_vec();
-        transaction.rollback();
-        Ok(())
+        transaction.rollback()
     }
 }
 
-/// Publish prepared files. It is safe to call repeatedly after a crash: an
-/// already-published file must match the transaction receipt.
 fn publish(prepared: &[PreparedExposure]) -> Result<()> {
     for exposure in prepared {
         let destination = Path::new(&exposure.receipt.path);
         let temporary = Path::new(&exposure.temporary);
-        if destination.exists() {
-            let data = std::fs::read(destination).at(destination)?;
-            if Sha256Digest::calculate(&data) != exposure.receipt.digest {
-                return Err(Error::ExposureConflict(destination.to_owned()));
-            }
-            if temporary.symlink_metadata().is_ok() {
-                std::fs::remove_file(temporary).at(temporary)?;
+
+        if exposure.remove {
+            if destination.exists() {
+                ensure_digest(destination, exposure.receipt.digest)?;
+                std::fs::remove_file(destination).at(destination)?;
             }
             continue;
         }
+
+        if destination.exists() {
+            let data = std::fs::read(destination).at(destination)?;
+            if Sha256Digest::calculate(&data) == exposure.receipt.digest {
+                remove_file_if_present(temporary)?;
+                continue;
+            }
+
+            let previous = exposure
+                .previous
+                .as_ref()
+                .ok_or_else(|| Error::ExposureConflict(destination.to_owned()))?;
+            ensure_digest(destination, previous.digest)?;
+            if !temporary.exists() {
+                return Err(Error::Transaction(format!(
+                    "prepared exposure is missing: {}",
+                    temporary.display()
+                )));
+            }
+            std::fs::rename(temporary, destination).at(destination)?;
+            continue;
+        }
+
         if !temporary.exists() {
             return Err(Error::Transaction(format!(
                 "prepared exposure is missing: {}",
                 temporary.display()
             )));
         }
-        // `rename` would replace a file created after preflight. Linking is
-        // an atomic no-replace publication because temporary and destination
-        // are deliberately siblings in the same filesystem.
         std::fs::hard_link(temporary, destination).at(destination)?;
         std::fs::remove_file(temporary).at(temporary)?;
     }
     Ok(())
 }
 
-pub fn cleanup_prepared(prepared: &[PreparedExposure]) {
-    for exposure in prepared {
-        let path = Path::new(&exposure.temporary);
-        if path.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(path);
+fn rollback_prepared(prepared: &[PreparedExposure]) -> Result<()> {
+    for exposure in prepared.iter().rev() {
+        let destination = Path::new(&exposure.receipt.path);
+        let temporary = Path::new(&exposure.temporary);
+
+        if let Some(previous) = &exposure.previous {
+            if let Some(backup) = exposure.backup.as_deref().map(Path::new) {
+                if backup.exists() {
+                    if destination.exists() {
+                        let data = std::fs::read(destination).at(destination)?;
+                        let digest = Sha256Digest::calculate(&data);
+                        if digest != exposure.receipt.digest && digest != previous.digest {
+                            return Err(Error::ExposureConflict(destination.to_owned()));
+                        }
+                    }
+                    std::fs::rename(backup, destination).at(destination)?;
+                }
+            }
+        } else if !exposure.remove && destination.exists() {
+            ensure_digest(destination, exposure.receipt.digest)?;
+            std::fs::remove_file(destination).at(destination)?;
+        }
+
+        remove_file_if_present(temporary)?;
+        if let Some(backup) = exposure.backup.as_deref().map(Path::new) {
+            remove_file_if_present(backup)?;
         }
     }
+    Ok(())
+}
+
+fn finalize_prepared(prepared: &[PreparedExposure]) -> Result<()> {
+    for exposure in prepared {
+        remove_file_if_present(Path::new(&exposure.temporary))?;
+        if let Some(backup) = exposure.backup.as_deref().map(Path::new) {
+            remove_file_if_present(backup)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn cleanup_prepared(prepared: &[PreparedExposure]) {
+    let _ = finalize_prepared(prepared);
 }
 
 /// Remove only exposure files whose content still matches the receipt.
@@ -283,11 +436,21 @@ fn write_exposure(path: &Path, data: &[u8], mode: u32) -> Result<()> {
 }
 
 fn temporary_path(path: &Path, transaction_id: &str) -> PathBuf {
+    private_path(path, transaction_id, "new")
+}
+
+fn backup_path(path: &Path, transaction_id: &str) -> PathBuf {
+    private_path(path, transaction_id, "old")
+}
+
+fn private_path(path: &Path, transaction_id: &str, suffix: &str) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("exposure");
-    path.with_file_name(format!(".{file_name}.pako-{transaction_id}.new"))
+    path.with_file_name(format!(
+        ".{file_name}.pako-{transaction_id}.{suffix}"
+    ))
 }
 
 fn exposure_receipt(kind: &str, path: &Path, data: &[u8]) -> ExposureReceipt {
@@ -298,9 +461,40 @@ fn exposure_receipt(kind: &str, path: &Path, data: &[u8]) -> ExposureReceipt {
     }
 }
 
+fn validate_existing_destination(
+    path: &Path,
+    previous: Option<&ExposureReceipt>,
+) -> Result<()> {
+    let Ok(metadata) = path.symlink_metadata() else {
+        return Ok(());
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::ExposureConflict(path.to_owned()));
+    }
+
+    let previous = previous.ok_or_else(|| Error::ExposureConflict(path.to_owned()))?;
+    ensure_digest(path, previous.digest)
+}
+
+fn ensure_digest(path: &Path, expected: Sha256Digest) -> Result<()> {
+    let data = std::fs::read(path).at(path)?;
+    if Sha256Digest::calculate(&data) == expected {
+        Ok(())
+    } else {
+        Err(Error::ExposureConflict(path.to_owned()))
+    }
+}
+
 fn ensure_available(path: &Path) -> Result<()> {
     if path.symlink_metadata().is_ok() {
         return Err(Error::ExposureConflict(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    if path.symlink_metadata().is_ok() {
+        std::fs::remove_file(path).at(path)?;
     }
     Ok(())
 }

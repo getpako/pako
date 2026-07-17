@@ -14,7 +14,7 @@ use crate::{
     object_store::ObjectStore,
     receipt::{PackageState, Receipt},
     transaction::{activate_symlink, CommitPlan, Journal, PackageLock, Phase, RecoveryAction},
-    verify, Result, Sha256Digest,
+    verify, Error, Result, Sha256Digest,
 };
 
 #[derive(Debug, Clone)]
@@ -109,6 +109,16 @@ impl Installer {
         };
 
         let previous = PackageState::load(&self.layout.package_state(&manifest.package)?).ok();
+        let previous_receipt = previous
+            .as_ref()
+            .map(|state| {
+                Receipt::load(
+                    &self
+                        .layout
+                        .version_record(&manifest.package, &state.active)?,
+                )
+            })
+            .transpose()?;
         let mut history = previous
             .as_ref()
             .map(|state| state.history.clone())
@@ -124,13 +134,17 @@ impl Installer {
         };
 
         let mut exposures = integrations::ExposureTransaction::begin(&self.layout, &journal.id)?;
-        exposures.preflight(manifest, &self.layout, &staging)?;
+        exposures.preflight(
+            manifest,
+            &self.layout,
+            &staging,
+            previous_receipt
+                .as_ref()
+                .map_or(&[], |receipt| receipt.exposures.as_slice()),
+        )?;
         let prepared = exposures.prepare()?.to_vec();
         let mut receipt = receipt;
-        receipt.exposures = prepared
-            .iter()
-            .map(|exposure| exposure.receipt.clone())
-            .collect();
+        receipt.exposures = exposures.published_receipts();
         journal.commit = Some(CommitPlan {
             receipt: receipt.clone(),
             state,
@@ -157,6 +171,7 @@ impl Installer {
             .save_atomic(&self.layout.package_state(&manifest.package)?)?;
 
         journal.advance(&self.layout, Phase::Complete)?;
+        exposures.finalize()?;
         journal.remove(&self.layout)?;
 
         Ok(receipt)
@@ -172,6 +187,7 @@ impl Installer {
     pub fn rollback(&self, package: &str, requested: Option<&str>) -> Result<String> {
         let _lock = PackageLock::acquire(&self.layout, package)?;
         let mut state = PackageState::load(&self.layout.package_state(package)?)?;
+        let active_version = state.active.clone();
 
         let target_version = requested
             .map(ToOwned::to_owned)
@@ -191,12 +207,43 @@ impl Installer {
 
         let manifest = self.load_manifest(package, &target_version)?;
         verify::verify_tree(&manifest, &target_path)?;
-        activate_symlink(&target_path, &self.layout.current_link(package)?)?;
+        let active_receipt =
+            Receipt::load(&self.layout.version_record(package, &active_version)?)?;
+        let target_receipt =
+            Receipt::load(&self.layout.version_record(package, &target_version)?)?;
+        let transaction_id = format!("rollback-{package}-{}", now_seconds());
+        let mut exposures = integrations::ExposureTransaction::begin(&self.layout, transaction_id)?;
+        exposures.preflight(
+            &manifest,
+            &self.layout,
+            &target_path,
+            &active_receipt.exposures,
+        )?;
+        exposures.prepare()?;
+        if exposures.published_receipts() != target_receipt.exposures {
+            exposures.rollback()?;
+            return Err(Error::Transaction(
+                "retained version integrations do not match their receipt".into(),
+            ));
+        }
 
-        state.history.retain(|version| version != &target_version);
-        state.history.insert(0, target_version.clone());
-        state.active.clone_from(&target_version);
-        state.save_atomic(&self.layout.package_state(package)?)?;
+        let current_link = self.layout.current_link(package)?;
+        let active_path = self.layout.package_version(package, &active_version)?;
+        let result = (|| -> Result<()> {
+            exposures.commit()?;
+            activate_symlink(&target_path, &current_link)?;
+            state.history.retain(|version| version != &target_version);
+            state.history.insert(0, target_version.clone());
+            state.active.clone_from(&target_version);
+            state.save_atomic(&self.layout.package_state(package)?)
+        })();
+
+        if let Err(error) = result {
+            let _ = activate_symlink(&active_path, &current_link);
+            let _ = exposures.rollback();
+            return Err(error);
+        }
+        exposures.finalize()?;
 
         Ok(target_version)
     }

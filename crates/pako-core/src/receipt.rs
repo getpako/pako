@@ -42,7 +42,7 @@ pub struct PackageState {
     pub channel: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExposureReceipt {
     pub kind: String,
