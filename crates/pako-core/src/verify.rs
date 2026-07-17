@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, fs::File, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    fs::File,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::Mutex,
+};
 
 use sha2::{Digest as _, Sha256};
 use walkdir::WalkDir;
@@ -19,41 +25,19 @@ pub struct VerificationReport {
 
 /// Verify that a materialized tree exactly matches its manifest.
 pub fn verify_tree(manifest: &PackageManifest, root: &Path) -> Result<VerificationReport> {
+    let jobs = std::thread::available_parallelism().map_or(1, usize::from);
+    verify_tree_with_jobs(manifest, root, jobs)
+}
+
+/// Verify package entries using a bounded filesystem worker pool.
+pub fn verify_tree_with_jobs(
+    manifest: &PackageManifest,
+    root: &Path,
+    jobs: usize,
+) -> Result<VerificationReport> {
     manifest.validate()?;
-    reject_undeclared_paths(manifest, root)?;
 
-    let mut tree_hash = new_tree_hash();
-    let mut report = VerificationReport {
-        files: 0,
-        directories: 0,
-        symlinks: 0,
-        tree_digest: Sha256Digest::EMPTY,
-    };
-
-    for entry in &manifest.entries {
-        match entry {
-            Entry::Directory { path, mode } => {
-                verify_directory(root, path, *mode, &mut tree_hash)?;
-                report.directories += 1;
-            }
-            Entry::File {
-                path,
-                mode,
-                size,
-                digest,
-                ..
-            } => {
-                verify_file(root, path, *mode, *size, *digest, &mut tree_hash)?;
-                report.files += 1;
-            }
-            Entry::Symlink { path, target } => {
-                verify_symlink(root, path, target, &mut tree_hash)?;
-                report.symlinks += 1;
-            }
-        }
-    }
-
-    let actual_tree_digest = Sha256Digest::from_bytes(tree_hash.finalize().into());
+    let actual_tree_digest = compute_tree_digest(&manifest.entries);
     if actual_tree_digest != manifest.tree_digest {
         return Err(Error::Integrity {
             path: root.to_owned(),
@@ -62,8 +46,40 @@ pub fn verify_tree(manifest: &PackageManifest, root: &Path) -> Result<Verificati
         });
     }
 
-    report.tree_digest = actual_tree_digest;
-    Ok(report)
+    reject_undeclared_paths(manifest, root)?;
+    verify_entries_parallel(manifest, root, jobs)?;
+
+    let files = u64::try_from(
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::File { .. }))
+            .count(),
+    )
+    .map_err(anyhow::Error::from)?;
+    let directories = u64::try_from(
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Directory { .. }))
+            .count(),
+    )
+    .map_err(anyhow::Error::from)?;
+    let symlinks = u64::try_from(
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Symlink { .. }))
+            .count(),
+    )
+    .map_err(anyhow::Error::from)?;
+
+    Ok(VerificationReport {
+        files,
+        directories,
+        symlinks,
+        tree_digest: actual_tree_digest,
+    })
 }
 
 pub fn compute_tree_digest(entries: &[Entry]) -> Sha256Digest {
@@ -118,12 +134,67 @@ fn reject_undeclared_paths(manifest: &PackageManifest, root: &Path) -> Result<()
     Ok(())
 }
 
-fn verify_directory(
-    root: &Path,
-    path: &crate::path::PackagePath,
-    mode: u16,
-    tree_hash: &mut Sha256,
-) -> Result<()> {
+fn verify_entries_parallel(manifest: &PackageManifest, root: &Path, jobs: usize) -> Result<()> {
+    if manifest.entries.is_empty() {
+        return Ok(());
+    }
+
+    let entries = manifest.entries.iter().enumerate().collect::<Vec<_>>();
+    let worker_count = jobs.max(1).min(entries.len());
+    log::debug!(
+        "verifying {} package entries with {worker_count} worker(s)",
+        entries.len()
+    );
+    let queue = Mutex::new(VecDeque::from(entries));
+    let results = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue = &queue;
+            let results = &results;
+            scope.spawn(move || loop {
+                let Some((index, entry)) = queue
+                    .lock()
+                    .expect("verification queue lock poisoned")
+                    .pop_front()
+                else {
+                    return;
+                };
+
+                let result = verify_entry(root, entry);
+                results
+                    .lock()
+                    .expect("verification result lock poisoned")
+                    .push((index, result));
+            });
+        }
+    });
+
+    let mut completed = results
+        .into_inner()
+        .expect("verification result lock poisoned");
+    completed.sort_by_key(|(index, _)| *index);
+    for (_, result) in completed {
+        result?;
+    }
+    Ok(())
+}
+
+fn verify_entry(root: &Path, entry: &Entry) -> Result<()> {
+    match entry {
+        Entry::Directory { path, mode } => verify_directory(root, path, *mode),
+        Entry::File {
+            path,
+            mode,
+            size,
+            digest,
+            ..
+        } => verify_file(root, path, *mode, *size, *digest),
+        Entry::Symlink { path, target } => verify_symlink(root, path, target),
+    }
+}
+
+fn verify_directory(root: &Path, path: &crate::path::PackagePath, mode: u16) -> Result<()> {
     let actual = path.join_to(root);
     let metadata = std::fs::symlink_metadata(&actual).at(&actual)?;
 
@@ -140,7 +211,6 @@ fn verify_directory(
         )));
     }
 
-    hash_directory(tree_hash, path.as_str(), mode);
     Ok(())
 }
 
@@ -150,7 +220,6 @@ fn verify_file(
     mode: u16,
     expected_size: u64,
     expected_digest: Sha256Digest,
-    tree_hash: &mut Sha256,
 ) -> Result<()> {
     let actual = path.join_to(root);
     let metadata = std::fs::symlink_metadata(&actual).at(&actual)?;
@@ -177,13 +246,6 @@ fn verify_file(
         });
     }
 
-    hash_file(
-        tree_hash,
-        path.as_str(),
-        mode,
-        expected_size,
-        expected_digest,
-    );
     Ok(())
 }
 
@@ -191,7 +253,6 @@ fn verify_symlink(
     root: &Path,
     path: &crate::path::PackagePath,
     expected_target: &str,
-    tree_hash: &mut Sha256,
 ) -> Result<()> {
     let actual = path.join_to(root);
     let metadata = std::fs::symlink_metadata(&actual).at(&actual)?;
@@ -207,7 +268,6 @@ fn verify_symlink(
         )));
     }
 
-    hash_symlink(tree_hash, path.as_str(), expected_target);
     Ok(())
 }
 

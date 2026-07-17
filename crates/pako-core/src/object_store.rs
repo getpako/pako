@@ -45,17 +45,57 @@ impl ObjectStore {
         }
 
         log::warn!("removing corrupted cached object {}", path.display());
-        std::fs::remove_file(&path).at(&path)?;
+        remove_file_if_present(&path)?;
         Ok(false)
     }
 
-    pub fn open_verified(&self, digest: Sha256Digest) -> Result<File> {
-        if !self.contains(digest)? {
+    /// Copy one cached object while verifying it in the same read pass.
+    ///
+    /// The supplied file hash is updated with the raw bytes so materialization
+    /// can verify both each chunk and the complete file without rereading the
+    /// object store.
+    pub fn copy_verified(
+        &self,
+        digest: Sha256Digest,
+        mut output: impl Write,
+        file_hash: &mut Sha256,
+    ) -> Result<u64> {
+        let path = self.path(digest);
+        if !path.exists() {
             return Err(Error::MissingChunk(digest.to_string()));
         }
 
-        let path = self.path(digest);
-        File::open(&path).at(&path)
+        let mut input = File::open(&path).at(&path)?;
+        let mut chunk_hash = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = vec![0_u8; 128 * 1024];
+
+        loop {
+            let count = input.read(&mut buffer).at(&path)?;
+            if count == 0 {
+                break;
+            }
+
+            output.write_all(&buffer[..count]).map_err(anyhow::Error::from)?;
+            chunk_hash.update(&buffer[..count]);
+            file_hash.update(&buffer[..count]);
+            total = total
+                .checked_add(count as u64)
+                .ok_or_else(|| anyhow::anyhow!("object copy size overflow"))?;
+        }
+
+        let actual = Sha256Digest::from_bytes(chunk_hash.finalize().into());
+        if actual != digest {
+            log::warn!("removing corrupted cached object {}", path.display());
+            remove_file_if_present(&path)?;
+            return Err(Error::Integrity {
+                path,
+                expected: digest.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+
+        Ok(total)
     }
 
     /// Import one raw object using an atomic no-clobber publish operation.
@@ -95,12 +135,44 @@ impl ObjectStore {
             });
         }
 
+        self.publish_verified_locked(temporary, expected, destination)
+    }
+
+    /// Create a temporary object beside its final content-addressed path.
+    pub fn create_temp_for(&self, digest: Sha256Digest) -> Result<NamedTempFile> {
+        let destination = self.path(digest);
+        let parent = destination
+            .parent()
+            .expect("object store paths always have a parent");
+        std::fs::create_dir_all(parent).at(parent)?;
+        NamedTempFile::new_in(parent).at(parent)
+    }
+
+    /// Publish content which has already been verified by the pack reader.
+    pub fn publish_verified(
+        &self,
+        temporary: NamedTempFile,
+        expected: Sha256Digest,
+    ) -> Result<PathBuf> {
+        let _lock = DigestLock::acquire(&self.lock_root, expected)?;
+        let destination = self.path(expected);
+        if self.contains(expected)? {
+            return Ok(destination);
+        }
+        self.publish_verified_locked(temporary, expected, destination)
+    }
+
+    fn publish_verified_locked(
+        &self,
+        temporary: NamedTempFile,
+        expected: Sha256Digest,
+        destination: PathBuf,
+    ) -> Result<PathBuf> {
         temporary.as_file().sync_all().at(temporary.path())?;
 
         match temporary.persist_noclobber(&destination) {
             Ok(_) => Ok(destination),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Another process won the race. Validate its object before accepting it.
                 if self.contains(expected)? {
                     Ok(destination)
                 } else {
@@ -119,15 +191,17 @@ impl ObjectStore {
     }
 
     pub fn remove(&self, digest: Sha256Digest) -> Result<()> {
-        let path = self.path(digest);
-        if path.exists() {
-            std::fs::remove_file(&path).at(&path)?;
-        }
-        Ok(())
+        remove_file_if_present(&self.path(digest))
     }
+}
 
-    pub fn create_temp(&self, directory: &Path) -> Result<NamedTempFile> {
-        std::fs::create_dir_all(directory).at(directory)?;
-        NamedTempFile::new_in(directory).at(directory)
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            path: path.to_owned(),
+            source,
+        }),
     }
 }

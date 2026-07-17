@@ -1,9 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::File,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
+use futures_util::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use pako_core::{
@@ -36,7 +38,8 @@ pub(crate) async fn publish(
     }
 
     info!("loading and verifying publish artifact");
-    let artifacts = Artifacts::load(artifact)?;
+    let artifact = artifact.to_owned();
+    let artifacts = tokio::task::spawn_blocking(move || Artifacts::load(&artifact)).await??;
     let mut client = OciClient::new()?;
     if insecure_http {
         client = client.insecure_http();
@@ -51,10 +54,21 @@ pub(crate) async fn publish(
     let config_digest = client.push_blob(&reference, config.path()).await?;
 
     info!("uploading package manifest");
-    let package_digest =
-        push_checked_blob(&client, &reference, &artifacts.package_manifest).await?;
+    let package_digest = push_checked_blob(
+        &client,
+        &reference,
+        &artifacts.package_manifest,
+        artifacts.package_manifest_digest,
+    )
+    .await?;
     info!("uploading pack index");
-    let index_digest = push_checked_blob(&client, &reference, &artifacts.pack_index).await?;
+    let index_digest = push_checked_blob(
+        &client,
+        &reference,
+        &artifacts.pack_index,
+        artifacts.pack_index_digest,
+    )
+    .await?;
     if package_digest != artifacts.package_manifest_digest
         || index_digest != artifacts.pack_index_digest
     {
@@ -71,17 +85,40 @@ pub(crate) async fn publish(
     ];
     let pack_count = artifacts.packs.len();
     let progress = pack_progress("uploading packs", pack_count);
-    for (digest, path) in &artifacts.packs {
-        let uploaded = push_checked_blob(&client, &reference, path).await?;
-        if uploaded != *digest {
-            anyhow::bail!(
-                "pack filename digest does not match its contents: {}",
-                path.display()
-            );
+    let upload_jobs = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(6);
+    let upload_client = client.clone();
+    let upload_reference = reference.clone();
+    let upload_progress = progress.clone();
+    let uploads = stream::iter(artifacts.packs.iter().map(move |(digest, path)| {
+        let digest = *digest;
+        let path = path.clone();
+        let progress = upload_progress.clone();
+        let client = upload_client.clone();
+        let reference = upload_reference.clone();
+        async move {
+            let uploaded = push_checked_blob(&client, &reference, &path, digest).await?;
+            if uploaded != digest {
+                anyhow::bail!(
+                    "pack filename digest does not match its contents: {}",
+                    path.display()
+                );
+            }
+            let layer = descriptor(PACK_MEDIA_TYPE, uploaded, &path)?;
+            progress.inc(1);
+            Ok::<_, anyhow::Error>((digest, layer))
         }
-        layers.push(descriptor(PACK_MEDIA_TYPE, uploaded, path)?);
-        progress.inc(1);
+    }))
+    .buffer_unordered(upload_jobs.max(1));
+
+    futures_util::pin_mut!(uploads);
+    let mut pack_layers = BTreeMap::new();
+    while let Some(result) = uploads.next().await {
+        let (digest, layer) = result?;
+        pack_layers.insert(digest, layer);
     }
+    layers.extend(pack_layers.into_values());
     progress.finish_with_message(format!("uploaded {pack_count} packs"));
 
     let manifest = ImageManifest {
@@ -192,21 +229,50 @@ impl Artifacts {
         }
         let pack_count = index.packs.len();
         let progress = pack_progress("verifying packs", pack_count);
-        let mut packs = BTreeMap::new();
-        for (digest, descriptor) in &index.packs {
-            let path = directory
-                .join("packs")
-                .join(format!("{}.pakopack", digest.hex()));
-            if std::fs::metadata(&path)?.len() != descriptor.size {
-                anyhow::bail!("pack size does not match index: {}", path.display());
+        let jobs = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(pack_count.max(1));
+        let pending = index
+            .packs
+            .iter()
+            .map(|(digest, descriptor)| (*digest, descriptor.size))
+            .collect::<Vec<_>>();
+        let queue = Mutex::new(VecDeque::from(pending));
+        let results = Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| {
+            for _ in 0..jobs {
+                let queue = &queue;
+                let results = &results;
+                let progress = progress.clone();
+                scope.spawn(move || loop {
+                    let Some((digest, size)) = queue
+                        .lock()
+                        .expect("pack verification queue lock poisoned")
+                        .pop_front()
+                    else {
+                        return;
+                    };
+                    let path = directory
+                        .join("packs")
+                        .join(format!("{}.pakopack", digest.hex()));
+                    let result = verify_pack_artifact(&path, digest, size)
+                        .map(|()| (digest, path));
+                    progress.inc(1);
+                    results
+                        .lock()
+                        .expect("pack verification result lock poisoned")
+                        .push(result);
+                });
             }
-            let (actual, _) = Sha256Digest::calculate_reader(File::open(&path)?)?;
-            if actual != *digest {
-                anyhow::bail!("pack digest does not match index: {}", path.display());
-            }
-            packs.insert(*digest, path);
-            progress.inc(1);
-        }
+        });
+
+        let verified = results
+            .into_inner()
+            .expect("pack verification result lock poisoned")
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let packs = verified.into_iter().collect::<BTreeMap<_, _>>();
         progress.finish_with_message(format!("verified {pack_count} packs"));
         Ok(Self {
             manifest,
@@ -217,6 +283,21 @@ impl Artifacts {
             packs,
         })
     }
+}
+
+fn verify_pack_artifact(
+    path: &Path,
+    expected_digest: Sha256Digest,
+    expected_size: u64,
+) -> anyhow::Result<()> {
+    if std::fs::metadata(path)?.len() != expected_size {
+        anyhow::bail!("pack size does not match index: {}", path.display());
+    }
+    let (actual, _) = Sha256Digest::calculate_reader(File::open(path)?)?;
+    if actual != expected_digest {
+        anyhow::bail!("pack digest does not match index: {}", path.display());
+    }
+    Ok(())
 }
 
 fn pack_progress(message: &str, pack_count: usize) -> ProgressBar {
@@ -236,8 +317,8 @@ async fn push_checked_blob(
     client: &OciClient,
     reference: &OciReference,
     path: &Path,
+    expected: Sha256Digest,
 ) -> anyhow::Result<Sha256Digest> {
-    let expected = Sha256Digest::calculate_reader(File::open(path)?)?.0;
     let actual = client.push_blob(reference, path).await?;
     if actual != expected {
         anyhow::bail!(

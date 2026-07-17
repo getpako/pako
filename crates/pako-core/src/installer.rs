@@ -27,17 +27,27 @@ pub struct InstallRequest {
 }
 
 /// Coordinates package installation and lifecycle operations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Installer {
     layout: Layout,
     store: ObjectStore,
+    jobs: usize,
 }
 
 impl Installer {
     pub fn new(layout: Layout) -> Result<Self> {
+        let jobs = std::thread::available_parallelism().map_or(1, usize::from);
+        Self::with_jobs(layout, jobs)
+    }
+
+    pub fn with_jobs(layout: Layout, jobs: usize) -> Result<Self> {
         layout.ensure()?;
         let store = ObjectStore::new(layout.objects(), layout.locks().join("objects"));
-        Ok(Self { layout, store })
+        Ok(Self {
+            layout,
+            store,
+            jobs: jobs.max(1),
+        })
     }
 
     pub fn layout(&self) -> &Layout {
@@ -91,11 +101,11 @@ impl Installer {
         journal.save(&self.layout)?;
 
         log::debug!("materializing package tree at {}", staging.display());
-        materialize::materialize(manifest, &self.store, &staging)?;
+        materialize::materialize_with_jobs(manifest, &self.store, &staging, self.jobs)?;
         journal.advance(&self.layout, Phase::Materialized)?;
 
         log::debug!("verifying staged package tree");
-        verify::verify_tree(manifest, &staging)?;
+        verify::verify_tree_with_jobs(manifest, &staging, self.jobs)?;
         journal.advance(&self.layout, Phase::Verified)?;
 
         // All possible integration conflicts are discovered before the new
@@ -191,7 +201,11 @@ impl Installer {
         let state = PackageState::load(&self.layout.package_state(package)?)?;
         let version = state.active;
         let manifest = self.load_manifest(package, &version)?;
-        verify::verify_tree(&manifest, &self.layout.package_version(package, &version)?)
+        verify::verify_tree_with_jobs(
+            &manifest,
+            &self.layout.package_version(package, &version)?,
+            self.jobs,
+        )
     }
 
     pub fn rollback(&self, package: &str, requested: Option<&str>) -> Result<String> {
@@ -216,7 +230,7 @@ impl Installer {
         }
 
         let manifest = self.load_manifest(package, &target_version)?;
-        verify::verify_tree(&manifest, &target_path)?;
+        verify::verify_tree_with_jobs(&manifest, &target_path, self.jobs)?;
         let active_receipt =
             Receipt::load(&self.layout.version_record(package, &active_version)?)?;
         let target_receipt =

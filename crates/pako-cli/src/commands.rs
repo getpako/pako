@@ -18,12 +18,16 @@ use crate::{
 pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
     let layout = Layout::discover()?;
     layout.ensure()?;
-    let installer = Installer::new(layout.clone())?;
-    let ui = Ui::new(cli.yes);
     let concurrency = cli.concurrency();
+    let installer = Installer::with_jobs(layout.clone(), concurrency.cpu_jobs)?;
+    let ui = Ui::new(cli.yes);
 
     if cli.mutates_package_state() {
-        let recovered = pako_core::transaction::recover(&layout)?;
+        let recovery_layout = layout.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            pako_core::transaction::recover(&recovery_layout)
+        })
+        .await??;
         if !recovered.is_empty() {
             ui.warning(format!(
                 "recovered {} interrupted transaction(s) before continuing",
@@ -64,7 +68,12 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify(arguments) => {
             let package = arguments.package;
             let step = ui.spinner(format!("Verifying {package}"));
-            let report = installer.verify(&package)?;
+            let local_installer = installer.clone();
+            let verify_package = package.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                local_installer.verify(&verify_package)
+            })
+            .await??;
             step.finish(format!(
                 "Verified {package}: {} files, {} directories, {} symlinks",
                 report.files, report.directories, report.symlinks
@@ -94,7 +103,13 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
             let step = ui.spinner(format!("Rolling back {package}"));
-            let version = installer.rollback(&package, Some(&target))?;
+            let local_installer = installer.clone();
+            let rollback_package = package.clone();
+            let rollback_target = target.clone();
+            let version = tokio::task::spawn_blocking(move || {
+                local_installer.rollback(&rollback_package, Some(&rollback_target))
+            })
+            .await??;
             step.finish(format!("Activated {package} {version}"));
         }
         Command::Versions(arguments) => {
@@ -113,12 +128,13 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
                 ui.note(format!("No retained versions of {package} need pruning"));
                 return Ok(());
             }
-            let reclaimed = removed.iter().try_fold(0_u64, |total, version| {
-                let size = directory_size(&layout.package_version(&package, version)?)?;
-                total
-                    .checked_add(size)
-                    .ok_or_else(|| anyhow::anyhow!("size overflow"))
-            })?;
+            let size_layout = layout.clone();
+            let size_package = package.clone();
+            let size_versions = removed.clone();
+            let reclaimed = tokio::task::spawn_blocking(move || {
+                retained_versions_size(&size_layout, &size_package, &size_versions)
+            })
+            .await??;
             ui.heading("Prune plan");
             ui.field("Package", &package);
             ui.field("Remove", format!("{} version(s)", removed.len()));
@@ -132,14 +148,21 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
             let step = ui.spinner(format!("Pruning retained versions of {package}"));
-            let removed = installer.prune(&package, keep)?;
+            let local_installer = installer.clone();
+            let prune_package = package.clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                local_installer.prune(&prune_package, keep)
+            })
+            .await??;
             step.finish(format!("Pruned {} retained version(s)", removed.len()));
         }
         Command::Remove(arguments) => {
             let package = arguments.package;
             let state = PackageState::load(&layout.package_state(&package)?)?;
             let receipt = Receipt::load(&layout.version_record(&package, &state.active)?)?;
-            let installed_bytes = directory_size(&layout.cellar().join(&package))?;
+            let package_directory = layout.cellar().join(&package);
+            let installed_bytes =
+                tokio::task::spawn_blocking(move || directory_size(&package_directory)).await??;
             ui.heading("Removal plan");
             ui.field("Package", &package);
             ui.field("Active", &state.active);
@@ -153,7 +176,9 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
             let step = ui.spinner(format!("Removing {package}"));
-            installer.remove(&package)?;
+            let local_installer = installer.clone();
+            let remove_package = package.clone();
+            tokio::task::spawn_blocking(move || local_installer.remove(&remove_package)).await??;
             step.finish(format!("Removed {package}"));
         }
         Command::List => list_receipts(&layout)?,
@@ -162,7 +187,11 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Recover => {
             let step = ui.spinner("Recovering interrupted transactions");
-            let recovered = pako_core::transaction::recover(&layout)?;
+            let recovery_layout = layout.clone();
+            let recovered = tokio::task::spawn_blocking(move || {
+                pako_core::transaction::recover(&recovery_layout)
+            })
+            .await??;
             step.finish(format!("Recovered {} transaction(s)", recovered.len()));
         }
     }
@@ -330,6 +359,19 @@ fn status(layout: &Layout, package: Option<&str>) -> anyhow::Result<()> {
         state.channel,
     );
     Ok(())
+}
+
+fn retained_versions_size(
+    layout: &Layout,
+    package: &str,
+    versions: &[String],
+) -> anyhow::Result<u64> {
+    versions.iter().try_fold(0_u64, |total, version| {
+        let size = directory_size(&layout.package_version(package, version)?)?;
+        total
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("size overflow"))
+    })
 }
 
 fn directory_size(path: &Path) -> anyhow::Result<u64> {

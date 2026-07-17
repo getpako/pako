@@ -72,6 +72,7 @@ pub(crate) struct RemoteInstallPlan {
     pub(crate) launcher_count: usize,
     pub(crate) desktop_entry_count: usize,
     pub(crate) icon_count: usize,
+    cpu_jobs: usize,
     download_jobs: usize,
     client: OciClient,
     platform_reference: OciReference,
@@ -160,14 +161,22 @@ pub(crate) async fn resolve_remote(
     pack_index.validate_against(&manifest)?;
     package_step.finish("Package metadata verified");
 
-    let available = collect_available_chunks(installer, &pack_index, concurrency.cpu_jobs, ui)?;
-    let cached_packs = collect_cached_packs(
-        installer,
-        &pack_index,
-        &available,
-        concurrency.cpu_jobs,
-        ui,
-    )?;
+    let cache_store = installer.store().clone();
+    let cache_packs_root = installer.layout().packs();
+    let cache_index = pack_index.clone();
+    let cache_jobs = concurrency.cpu_jobs;
+    let (available, cached_packs) = tokio::task::spawn_blocking(move || {
+        let available = collect_available_chunks(&cache_store, &cache_index, cache_jobs, ui)?;
+        let cached_packs = collect_cached_packs(
+            &cache_packs_root,
+            &cache_index,
+            &available,
+            cache_jobs,
+            ui,
+        )?;
+        Ok::<_, anyhow::Error>((available, cached_packs))
+    })
+    .await??;
     let download = planner::plan(&pack_index, &available, &cached_packs)?;
     let total_raw_bytes = pack_index
         .chunks
@@ -209,6 +218,7 @@ pub(crate) async fn resolve_remote(
         launcher_count: manifest.integrations.launchers.len(),
         desktop_entry_count: manifest.integrations.desktop_entries.len(),
         icon_count: manifest.integrations.icons.len(),
+        cpu_jobs: concurrency.cpu_jobs,
         download_jobs: concurrency.download_jobs,
         total_chunks: pack_index.chunks.len(),
         available_chunks: available.len(),
@@ -236,18 +246,26 @@ pub(crate) async fn execute_remote(
         return Ok(InstallOutcome::AlreadyCurrent);
     }
 
-    if plan.download.network_bytes > 0 {
-        let progress = ui.byte_progress("Downloading package data", plan.download.network_bytes);
+    if !plan.download.missing_chunks.is_empty() {
+        let progress = if plan.download.network_bytes > 0 {
+            ui.byte_progress("Downloading package data", plan.download.network_bytes)
+        } else {
+            ProgressBar::hidden()
+        };
         download_missing_chunks(
             installer,
             &plan.client,
             &plan.platform_reference,
             &plan.download,
+            plan.cpu_jobs,
             plan.download_jobs,
+            ui,
             &progress,
         )
         .await?;
-        progress.finish_with_message("Downloaded package data");
+        if plan.download.network_bytes > 0 {
+            progress.finish_with_message("Downloaded package data");
+        }
     } else {
         log::info!("all required chunks are already available locally");
     }
@@ -260,7 +278,13 @@ pub(crate) async fn execute_remote(
         pack_index_digest: plan.pack_index_digest,
         channel: plan.channel,
     };
-    let receipt = installer.install(&plan.manifest, &plan.pack_index, &request)?;
+    let local_installer = installer.clone();
+    let manifest = plan.manifest;
+    let pack_index = plan.pack_index;
+    let receipt = tokio::task::spawn_blocking(move || {
+        local_installer.install(&manifest, &pack_index, &request)
+    })
+    .await??;
     step.finish("Package materialized, verified, and activated");
     Ok(InstallOutcome::Installed(receipt))
 }
@@ -406,7 +430,7 @@ fn validate_cached_blob(
 }
 
 fn collect_available_chunks(
-    installer: &Installer,
+    store: &pako_core::object_store::ObjectStore,
     index: &PackIndex,
     worker_limit: usize,
     ui: Ui,
@@ -419,7 +443,7 @@ fn collect_available_chunks(
 
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
-            let store = installer.store().clone();
+            let store = store.clone();
             let queue = &queue;
             let results = &results;
             let progress = progress.clone();
@@ -454,7 +478,7 @@ fn collect_available_chunks(
 }
 
 fn collect_cached_packs(
-    installer: &Installer,
+    packs_root: &Path,
     index: &PackIndex,
     available_chunks: &BTreeSet<Sha256Digest>,
     worker_limit: usize,
@@ -478,14 +502,12 @@ fn collect_cached_packs(
     let worker_count = worker_limit.max(1).min(required.len());
     let queue = Mutex::new(VecDeque::from(required));
     let results = Mutex::new(Vec::new());
-    let packs_root = installer.layout().packs();
-
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             let queue = &queue;
             let results = &results;
             let progress = progress.clone();
-            let packs_root = packs_root.clone();
+            let packs_root = packs_root.to_owned();
             scope.spawn(move || loop {
                 let Some((digest, size)) = queue
                     .lock()
@@ -523,7 +545,9 @@ async fn download_missing_chunks(
     client: &OciClient,
     reference: &OciReference,
     plan: &planner::DownloadPlan,
+    cpu_jobs: usize,
     download_jobs: usize,
+    ui: Ui,
     progress: &ProgressBar,
 ) -> anyhow::Result<()> {
     let packs_root = installer.layout().packs();
@@ -568,18 +592,94 @@ async fn download_missing_chunks(
         result?;
     }
 
-    for planned_pack in &plan.packs {
-        let pack_path = packs_root.join(format!("{}.pakopack", planned_pack.digest.hex()));
-        let mut reader = PackReader::open(&pack_path)?;
-        for digest in &planned_pack.needed_chunks {
-            let mut temporary = installer
-                .store()
-                .create_temp(installer.layout().cache.as_path())?;
-            reader.extract(*digest, &mut temporary)?;
-            installer.store().import(temporary.reopen()?, *digest)?;
-        }
+    let import_progress = ui.item_progress(
+        "Importing missing chunks",
+        plan.missing_chunks.len(),
+        "chunks",
+    );
+    let packs = plan.packs.clone();
+    let store = installer.store().clone();
+    let packs_root_for_extract = packs_root.clone();
+    tokio::task::spawn_blocking(move || {
+        extract_packs_parallel(packs, packs_root_for_extract, store, cpu_jobs, import_progress)
+    })
+    .await??;
+
+    Ok(())
+}
+
+fn extract_packs_parallel(
+    packs: Vec<planner::PlannedPack>,
+    packs_root: PathBuf,
+    store: pako_core::object_store::ObjectStore,
+    jobs: usize,
+    progress: ProgressBar,
+) -> anyhow::Result<()> {
+    if packs.is_empty() {
+        progress.finish_with_message("No chunks need importing");
+        return Ok(());
     }
 
+    let worker_count = jobs.max(1).min(packs.len());
+    log::info!(
+        "extracting {} pack(s) with {worker_count} worker(s)",
+        packs.len()
+    );
+    let queue = Mutex::new(VecDeque::from(
+        packs.into_iter().enumerate().collect::<Vec<_>>(),
+    ));
+    let results = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue = &queue;
+            let results = &results;
+            let packs_root = &packs_root;
+            let store = &store;
+            let progress = progress.clone();
+            scope.spawn(move || loop {
+                let Some((index, planned_pack)) = queue
+                    .lock()
+                    .expect("pack extraction queue lock poisoned")
+                    .pop_front()
+                else {
+                    return;
+                };
+
+                let result = extract_pack(packs_root, store, &planned_pack, &progress);
+                results
+                    .lock()
+                    .expect("pack extraction result lock poisoned")
+                    .push((index, result));
+            });
+        }
+    });
+
+    let mut completed = results
+        .into_inner()
+        .expect("pack extraction result lock poisoned");
+    completed.sort_by_key(|(index, _)| *index);
+    for (_, result) in completed {
+        result?;
+    }
+    progress.finish_with_message("Imported missing chunks");
+    Ok(())
+}
+
+fn extract_pack(
+    packs_root: &Path,
+    store: &pako_core::object_store::ObjectStore,
+    planned_pack: &planner::PlannedPack,
+    progress: &ProgressBar,
+) -> anyhow::Result<()> {
+    let pack_path = packs_root.join(format!("{}.pakopack", planned_pack.digest.hex()));
+    let mut reader = PackReader::open(&pack_path)?;
+    for digest in &planned_pack.needed_chunks {
+        let mut temporary = store.create_temp_for(*digest)?;
+        reader.extract(*digest, &mut temporary)?;
+        store.publish_verified(temporary, *digest)?;
+        progress.inc(1);
+    }
     Ok(())
 }
 
