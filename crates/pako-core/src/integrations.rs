@@ -448,9 +448,7 @@ fn private_path(path: &Path, transaction_id: &str, suffix: &str) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("exposure");
-    path.with_file_name(format!(
-        ".{file_name}.pako-{transaction_id}.{suffix}"
-    ))
+    path.with_file_name(format!(".{file_name}.pako-{transaction_id}.{suffix}"))
 }
 
 fn exposure_receipt(kind: &str, path: &Path, data: &[u8]) -> ExposureReceipt {
@@ -461,10 +459,7 @@ fn exposure_receipt(kind: &str, path: &Path, data: &[u8]) -> ExposureReceipt {
     }
 }
 
-fn validate_existing_destination(
-    path: &Path,
-    previous: Option<&ExposureReceipt>,
-) -> Result<()> {
+fn validate_existing_destination(path: &Path, previous: Option<&ExposureReceipt>) -> Result<()> {
     let Ok(metadata) = path.symlink_metadata() else {
         return Ok(());
     };

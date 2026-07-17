@@ -385,6 +385,12 @@ its build environments.
 
 The client must not require `docker`, `podman`, `oras`, or `skopeo`.
 
+OCI and other low-level crates must not create terminal progress bars on their
+own. A command-level caller owns each visible operation and may pass a shared
+progress bar into transfer methods. All visible bars and terminal log messages
+are coordinated through the process-wide renderer in `pako-log`, so concurrent
+tasks never draw independent bars into the same terminal rows.
+
 A registry abstraction should be close to:
 
 ```rust

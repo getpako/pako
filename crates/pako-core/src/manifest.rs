@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    path::{validate_managed_name, validate_symlink_target, validate_upstream_version, PackagePath},
+    path::{
+        validate_managed_name, validate_symlink_target, validate_upstream_version, PackagePath,
+    },
     Error, Result, Sha256Digest,
 };
 
@@ -362,7 +364,10 @@ pub fn validate_package_name(name: &str) -> Result<()> {
 }
 
 fn validate_single_line(value: &str, field: &str) -> Result<()> {
-    if value.chars().any(|character| matches!(character, '\0' | '\n' | '\r')) {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    {
         Err(Error::InvalidManifest(format!("invalid {field}")))
     } else {
         Ok(())

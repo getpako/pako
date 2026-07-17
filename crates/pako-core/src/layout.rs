@@ -2,11 +2,7 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 
-use crate::{
-    manifest::validate_package_name,
-    path::validate_local_version,
-    Result,
-};
+use crate::{manifest::validate_package_name, path::validate_local_version, Result};
 
 /// Filesystem locations used by Pako.
 ///

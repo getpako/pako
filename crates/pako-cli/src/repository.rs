@@ -84,7 +84,10 @@ pub(crate) struct RemoteInstallPlan {
 
 impl RemoteInstallPlan {
     pub(crate) fn version(&self) -> String {
-        format!("{}-{}", self.manifest.upstream_version, self.manifest.release)
+        format!(
+            "{}-{}",
+            self.manifest.upstream_version, self.manifest.release
+        )
     }
 
     pub(crate) fn cache_growth(&self) -> u64 {
@@ -168,13 +171,8 @@ pub(crate) async fn resolve_remote(
     let cache_jobs = concurrency.cpu_jobs;
     let (available, cached_packs) = tokio::task::spawn_blocking(move || {
         let available = collect_available_chunks(&cache_store, &cache_index, cache_jobs, ui)?;
-        let cached_packs = collect_cached_packs(
-            &cache_packs_root,
-            &cache_index,
-            &available,
-            cache_jobs,
-            ui,
-        )?;
+        let cached_packs =
+            collect_cached_packs(&cache_packs_root, &cache_index, &available, cache_jobs, ui)?;
         Ok::<_, anyhow::Error>((available, cached_packs))
     })
     .await??;
@@ -182,7 +180,9 @@ pub(crate) async fn resolve_remote(
     let total_raw_bytes = pack_index
         .chunks
         .values()
-        .try_fold(0_u64, |total, location| total.checked_add(location.raw_size))
+        .try_fold(0_u64, |total, location| {
+            total.checked_add(location.raw_size)
+        })
         .ok_or_else(|| anyhow::anyhow!("package chunk size overflow"))?;
     let installed_bytes = manifest
         .entries
@@ -197,11 +197,7 @@ pub(crate) async fn resolve_remote(
     let state_path = installer.layout().package_state(package)?;
     let current = if state_path.exists() {
         let state = PackageState::load(&state_path)?;
-        let receipt = Receipt::load(
-            &installer
-                .layout()
-                .version_record(package, &state.active)?,
-        )?;
+        let receipt = Receipt::load(&installer.layout().version_record(package, &state.active)?)?;
         Some((state, receipt))
     } else {
         None
@@ -266,9 +262,6 @@ pub(crate) async fn execute_remote(
             &progress,
         )
         .await?;
-        if plan.download.network_bytes > 0 {
-            progress.finish_with_message("Downloaded package data");
-        }
     }
 
     let step = ui.spinner("Materializing and verifying package");
@@ -393,8 +386,8 @@ async fn fetch_cached_blob(
     lock_directory: &Path,
 ) -> anyhow::Result<()> {
     let lock_directory = lock_directory.to_owned();
-    let lock = tokio::task::spawn_blocking(move || DigestLock::acquire(&lock_directory, digest))
-        .await??;
+    let lock =
+        tokio::task::spawn_blocking(move || DigestLock::acquire(&lock_directory, digest)).await??;
 
     if validate_cached_blob(path, digest, size)? {
         log::debug!("using verified cached metadata blob {digest}");
@@ -470,8 +463,15 @@ fn collect_available_chunks(
         .into_inner()
         .expect("chunk check result lock poisoned")
         .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    progress.finish_with_message("Checked local chunk cache");
+        .collect::<std::result::Result<Vec<_>, _>>();
+    let checked = match checked {
+        Ok(checked) => checked,
+        Err(error) => {
+            pako_log::abandon_progress(&progress, "Local chunk cache check failed");
+            return Err(error.into());
+        }
+    };
+    pako_log::finish_progress(&progress, "Checked local chunk cache");
     Ok(checked
         .into_iter()
         .filter_map(|(digest, present)| present.then_some(digest))
@@ -518,8 +518,8 @@ fn collect_cached_packs(
                     return;
                 };
                 let path = packs_root.join(format!("{}.pakopack", digest.hex()));
-                let result = validate_cached_pack(&path, digest, size)
-                    .map(|present| (digest, present));
+                let result =
+                    validate_cached_pack(&path, digest, size).map(|present| (digest, present));
                 progress.inc(1);
                 results
                     .lock()
@@ -533,8 +533,15 @@ fn collect_cached_packs(
         .into_inner()
         .expect("pack check result lock poisoned")
         .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    progress.finish_with_message("Checked local pack cache");
+        .collect::<std::result::Result<Vec<_>, _>>();
+    let checked = match checked {
+        Ok(checked) => checked,
+        Err(error) => {
+            pako_log::abandon_progress(&progress, "Local pack cache check failed");
+            return Err(error.into());
+        }
+    };
+    pako_log::finish_progress(&progress, "Checked local pack cache");
     Ok(checked
         .into_iter()
         .filter_map(|(digest, present)| present.then_some(digest))
@@ -554,45 +561,48 @@ async fn download_missing_chunks(
 ) -> anyhow::Result<()> {
     let packs_root = installer.layout().packs();
     let lock_root = installer.layout().locks().join("packs");
-    let downloads = stream::iter(
-        plan.packs
-            .iter()
-            .filter(|pack| !pack.cached)
-            .cloned()
-            .map(|planned_pack| {
-                let pack_path =
-                    packs_root.join(format!("{}.pakopack", planned_pack.digest.hex()));
-                let lock_root = lock_root.clone();
-                let progress = progress.clone();
-                async move {
-                    let digest = planned_pack.digest;
-                    let size = planned_pack.size;
-                    let lock = tokio::task::spawn_blocking(move || {
-                        DigestLock::acquire(&lock_root, digest)
-                    })
-                    .await??;
+    let downloads = stream::iter(plan.packs.iter().filter(|pack| !pack.cached).cloned().map(
+        |planned_pack| {
+            let pack_path = packs_root.join(format!("{}.pakopack", planned_pack.digest.hex()));
+            let lock_root = lock_root.clone();
+            let progress = progress.clone();
+            async move {
+                let digest = planned_pack.digest;
+                let size = planned_pack.size;
+                let lock =
+                    tokio::task::spawn_blocking(move || DigestLock::acquire(&lock_root, digest))
+                        .await??;
 
-                    if validate_cached_pack(&pack_path, digest, size)? {
-                        log::info!("pack {digest} was completed by another Pako process");
-                        progress.inc(size);
-                        drop(lock);
-                        return Ok::<(), anyhow::Error>(());
-                    }
-
-                    client
-                        .fetch_blob_with_progress(reference, digest, &pack_path, &progress)
-                        .await?;
+                if validate_cached_pack(&pack_path, digest, size)? {
+                    log::info!("pack {digest} was completed by another Pako process");
+                    progress.inc(size);
                     drop(lock);
-                    Ok::<(), anyhow::Error>(())
+                    return Ok::<(), anyhow::Error>(());
                 }
-            }),
-    )
+
+                client
+                    .fetch_blob_with_progress(reference, digest, &pack_path, &progress)
+                    .await?;
+                drop(lock);
+                Ok::<(), anyhow::Error>(())
+            }
+        },
+    ))
     .buffer_unordered(download_jobs.max(1));
 
     futures_util::pin_mut!(downloads);
-    while let Some(result) = downloads.next().await {
-        result?;
+    let download_result = async {
+        while let Some(result) = downloads.next().await {
+            result?;
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    if let Err(error) = download_result {
+        pako_log::abandon_progress(progress, "Package download failed");
+        return Err(error);
+    }
+    pako_log::finish_progress(progress, "Downloaded package data");
 
     let import_progress = ui.item_progress(
         "Importing missing chunks",
@@ -602,12 +612,31 @@ async fn download_missing_chunks(
     let packs = plan.packs.clone();
     let store = installer.store().clone();
     let packs_root_for_extract = packs_root.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_packs_parallel(packs, &packs_root_for_extract, &store, cpu_jobs, import_progress)
+    let import_bar = import_progress.clone();
+    let import_result = tokio::task::spawn_blocking(move || {
+        extract_packs_parallel(
+            packs,
+            &packs_root_for_extract,
+            &store,
+            cpu_jobs,
+            &import_progress,
+        )
     })
-    .await??;
-
-    Ok(())
+    .await;
+    match import_result {
+        Ok(Ok(())) => {
+            pako_log::finish_progress(&import_bar, "Imported missing chunks");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            pako_log::abandon_progress(&import_bar, "Chunk import failed");
+            Err(error)
+        }
+        Err(error) => {
+            pako_log::abandon_progress(&import_bar, "Chunk import task failed");
+            Err(error.into())
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -616,10 +645,9 @@ fn extract_packs_parallel(
     packs_root: &PathBuf,
     store: &pako_core::object_store::ObjectStore,
     jobs: usize,
-    progress: ProgressBar,
+    progress: &ProgressBar,
 ) -> anyhow::Result<()> {
     if packs.is_empty() {
-        progress.finish_with_message("No chunks need importing");
         return Ok(());
     }
 
@@ -665,7 +693,6 @@ fn extract_packs_parallel(
     for (_, result) in completed {
         result?;
     }
-    progress.finish_with_message("Imported missing chunks");
     Ok(())
 }
 

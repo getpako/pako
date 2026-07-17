@@ -185,8 +185,7 @@ fn create_file(entry: &Entry, store: &ObjectStore, destination: &Path) -> Result
         });
     }
 
-    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(u32::from(*mode)))
-        .at(&output)
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(u32::from(*mode))).at(&output)
 }
 
 fn create_symlinks(manifest: &PackageManifest, destination: &Path) -> Result<()> {

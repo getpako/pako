@@ -68,11 +68,11 @@ fn extract_tar(reader: impl Read, destination: &Path, strip_components: u32) -> 
 
     match result {
         Ok(()) => {
-            progress.finish_with_message("extracted archive");
+            pako_log::finish_progress(&progress, "Extracted archive");
             Ok(())
         }
         Err(error) => {
-            progress.abandon_with_message("archive extraction failed");
+            pako_log::abandon_progress(&progress, "Archive extraction failed");
             Err(error)
         }
     }
@@ -118,20 +118,20 @@ fn extract_zip(
 
     match result {
         Ok(()) => {
-            progress.finish_with_message("extracted archive");
+            pako_log::finish_progress(&progress, "Extracted archive");
             Ok(())
         }
         Err(error) => {
-            progress.abandon_with_message("archive extraction failed");
+            pako_log::abandon_progress(&progress, "Archive extraction failed");
             Err(error)
         }
     }
 }
 
 fn extraction_progress(total: Option<usize>, message: &str) -> ProgressBar {
-    let progress = total.map_or_else(ProgressBar::new_spinner, |total| {
+    let progress = pako_log::add_progress(total.map_or_else(ProgressBar::new_spinner, |total| {
         ProgressBar::new(total as u64)
-    });
+    }));
     let style = match total {
         Some(_) => ProgressStyle::with_template(
             "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} entries ({per_sec})",

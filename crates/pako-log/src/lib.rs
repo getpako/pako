@@ -1,12 +1,15 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::{self, IsTerminal as _, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use indicatif::{MultiProgress, ProgressBar};
 use log::{Level, LevelFilter, Log, Metadata, Record};
+
+static PROGRESS: OnceLock<MultiProgress> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct LogHandle {
@@ -54,8 +57,12 @@ impl Log for PakoLogger {
                 Level::Debug => "debug",
                 Level::Trace => "trace",
             };
-            let mut stderr = io::stderr().lock();
-            let _ = writeln!(stderr, "{prefix}: {}", record.args());
+            if io::stderr().is_terminal() {
+                let _ = progress().println(format!("{prefix}: {}", record.args()));
+            } else {
+                let mut stderr = io::stderr().lock();
+                let _ = writeln!(stderr, "{prefix}: {}", record.args());
+            }
         }
     }
 
@@ -74,10 +81,7 @@ pub fn init(
 ) -> anyhow::Result<LogHandle> {
     std::fs::create_dir_all(log_directory)?;
     let operation_name = sanitize_name(operation_name);
-    let path = log_directory.join(format!(
-        "{operation_name}-{}.log",
-        unix_timestamp()
-    ));
+    let path = log_directory.join(format!("{operation_name}-{}.log", unix_timestamp()));
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -97,6 +101,37 @@ pub fn init(
     log::info!(target: "pako", "operation log: {}", path.display());
 
     Ok(LogHandle { path })
+}
+
+/// Add a progress bar to the process-wide renderer.
+///
+/// Every Pako crate must register visible progress bars here instead of
+/// drawing independently. `indicatif::MultiProgress` then serializes updates
+/// from async tasks, worker threads and logger output without duplicated lines.
+pub fn add_progress(progress_bar: ProgressBar) -> ProgressBar {
+    progress().add(progress_bar)
+}
+
+/// Temporarily hide all progress bars while printing or reading terminal UI.
+pub fn suspend_progress<R>(operation: impl FnOnce() -> R) -> R {
+    progress().suspend(operation)
+}
+
+/// Finish a progress bar and stop its background ticker before drawing the
+/// final line.
+pub fn finish_progress(progress_bar: &ProgressBar, message: impl Into<String>) {
+    progress_bar.disable_steady_tick();
+    progress_bar.finish_with_message(message.into());
+}
+
+/// Abandon a progress bar and stop its background ticker on an error path.
+pub fn abandon_progress(progress_bar: &ProgressBar, message: impl Into<String>) {
+    progress_bar.disable_steady_tick();
+    progress_bar.abandon_with_message(message.into());
+}
+
+fn progress() -> &'static MultiProgress {
+    PROGRESS.get_or_init(MultiProgress::new)
 }
 
 fn sanitize_name(value: &str) -> String {

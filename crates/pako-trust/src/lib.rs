@@ -145,7 +145,10 @@ impl TrustedRepository {
         let bytes = stream.into_vec().await?;
         let catalog: ReleaseCatalog = serde_json::from_slice(&bytes)?;
         catalog.validate()?;
-        log::debug!("loaded {} package(s) from signed catalog", catalog.packages.len());
+        log::debug!(
+            "loaded {} package(s) from signed catalog",
+            catalog.packages.len()
+        );
         Ok(catalog)
     }
 }

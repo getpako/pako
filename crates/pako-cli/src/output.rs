@@ -17,19 +17,19 @@ impl Ui {
     }
 
     pub(crate) fn heading(self, title: &str) {
-        println!("{title}");
+        pako_log::suspend_progress(|| println!("{title}"));
     }
 
     pub(crate) fn field(self, label: &str, value: impl std::fmt::Display) {
-        println!("  {label:<14} {value}");
+        pako_log::suspend_progress(|| println!("  {label:<14} {value}"));
     }
 
     pub(crate) fn blank(self) {
-        println!();
+        pako_log::suspend_progress(|| println!());
     }
 
     pub(crate) fn note(self, message: impl std::fmt::Display) {
-        println!("{message}");
+        pako_log::suspend_progress(|| println!("{message}"));
     }
 
     pub(crate) fn warning(self, message: impl std::fmt::Display) {
@@ -45,20 +45,22 @@ impl Ui {
             anyhow::bail!("confirmation requires a terminal; rerun with --yes");
         }
 
-        print!("{prompt} [y/N] ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        Ok(matches!(
-            input.trim().to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        ))
+        pako_log::suspend_progress(|| {
+            print!("{prompt} [y/N] ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            Ok(matches!(
+                input.trim().to_ascii_lowercase().as_str(),
+                "y" | "yes"
+            ))
+        })
     }
 
     pub(crate) fn spinner(self, message: impl Into<String>) -> Step {
         let message = message.into();
         log::info!(target: "pako.ui", "{message}");
-        let progress = ProgressBar::new_spinner();
+        let progress = pako_log::add_progress(ProgressBar::new_spinner());
         progress.set_style(
             ProgressStyle::with_template("{spinner:.green} {msg}")
                 .expect("spinner progress template is valid"),
@@ -68,11 +70,12 @@ impl Ui {
         Step {
             progress,
             started: Instant::now(),
+            finished: false,
         }
     }
 
     pub(crate) fn byte_progress(self, message: impl Into<String>, total: u64) -> ProgressBar {
-        let progress = ProgressBar::new(total);
+        let progress = pako_log::add_progress(ProgressBar::new(total));
         progress.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
@@ -91,7 +94,7 @@ impl Ui {
         total: usize,
         unit: &str,
     ) -> ProgressBar {
-        let progress = ProgressBar::new(total as u64);
+        let progress = pako_log::add_progress(ProgressBar::new(total as u64));
         progress.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} {prefix} ({per_sec})",
@@ -110,20 +113,28 @@ impl Ui {
 pub(crate) struct Step {
     progress: ProgressBar,
     started: Instant,
+    finished: bool,
 }
 
 impl Step {
-    pub(crate) fn finish(self, message: impl Into<String>) {
+    pub(crate) fn finish(mut self, message: impl Into<String>) {
         let message = message.into();
         let elapsed = self.started.elapsed();
-        self.progress.finish_with_message(format!(
-            "{message} ({})",
-            format_duration(elapsed)
-        ));
+        pako_log::finish_progress(
+            &self.progress,
+            format!("{message} ({})", format_duration(elapsed)),
+        );
+        self.finished = true;
         log::info!(target: "pako.ui", "{message} in {}", format_duration(elapsed));
     }
+}
 
-
+impl Drop for Step {
+    fn drop(&mut self) {
+        if !self.finished {
+            pako_log::abandon_progress(&self.progress, "Operation interrupted");
+        }
+    }
 }
 
 pub(crate) fn format_size(bytes: u64) -> String {
@@ -144,7 +155,11 @@ pub(crate) fn format_size(bytes: u64) -> String {
 
 pub(crate) fn format_duration(duration: Duration) -> String {
     if duration.as_secs() > 0 {
-        format!("{}.{:01}s", duration.as_secs(), duration.subsec_millis() / 100)
+        format!(
+            "{}.{:01}s",
+            duration.as_secs(),
+            duration.subsec_millis() / 100
+        )
     } else {
         format!("{}ms", duration.as_millis())
     }

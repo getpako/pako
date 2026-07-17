@@ -361,9 +361,9 @@ impl Builder {
         .await;
 
         match result {
-            Ok(()) => progress.finish_with_message(format!("downloaded {source_name}")),
+            Ok(()) => pako_log::finish_progress(&progress, format!("Downloaded {source_name}")),
             Err(_) => {
-                progress.abandon_with_message(format!("download failed for {source_name}"));
+                pako_log::abandon_progress(&progress, format!("Download failed for {source_name}"));
             }
         }
         result
@@ -394,10 +394,10 @@ fn source_filename_from_url(url: &str) -> String {
 }
 
 fn download_progress(source_name: &str, length: Option<u64>) -> ProgressBar {
-    let progress = match length {
+    let progress = pako_log::add_progress(match length {
         Some(length) => ProgressBar::new(length),
         None => ProgressBar::new_spinner(),
-    };
+    });
     let style = match length {
         Some(_) => ProgressStyle::with_template(
             "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
@@ -601,11 +601,11 @@ fn scan_tree(root: &Path, chunks_directory: &Path, jobs: usize) -> anyhow::Resul
     let scanned = scan_files(files, chunks_directory, worker_count, &progress);
     match scanned {
         Ok(scanned) => {
-            progress.finish_with_message(format!("scanned {file_count} files"));
+            pako_log::finish_progress(&progress, format!("Scanned {file_count} files"));
             entries.extend(scanned);
         }
         Err(error) => {
-            progress.abandon_with_message("file scan failed");
+            pako_log::abandon_progress(&progress, "File scan failed");
             return Err(error);
         }
     }
@@ -650,7 +650,7 @@ fn scan_files(
 }
 
 fn scan_progress(file_count: usize) -> ProgressBar {
-    let progress = ProgressBar::new(file_count as u64);
+    let progress = pako_log::add_progress(ProgressBar::new(file_count as u64));
     let style = ProgressStyle::with_template(
         "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} files ({per_sec})",
     )
@@ -747,11 +747,11 @@ fn build_packs(
     );
     let completed = match compressed {
         Ok(completed) => {
-            progress.finish_with_message(format!("compressed {pack_count} packs"));
+            pako_log::finish_progress(&progress, format!("Compressed {pack_count} packs"));
             completed
         }
         Err(error) => {
-            progress.abandon_with_message("pack compression failed");
+            pako_log::abandon_progress(&progress, "Pack compression failed");
             return Err(error);
         }
     };
@@ -861,7 +861,7 @@ fn compress_packs(
 }
 
 fn pack_progress(pack_count: usize) -> ProgressBar {
-    let progress = ProgressBar::new(pack_count as u64);
+    let progress = pako_log::add_progress(ProgressBar::new(pack_count as u64));
     let style = ProgressStyle::with_template(
         "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} packs ({per_sec})",
     )

@@ -166,8 +166,7 @@ pub fn validate_cached_pack(
         return Ok(false);
     }
 
-    let (actual_digest, actual_size) =
-        Sha256Digest::calculate_reader(File::open(path).at(path)?)?;
+    let (actual_digest, actual_size) = Sha256Digest::calculate_reader(File::open(path).at(path)?)?;
     if actual_size != expected_size || actual_digest != expected_digest {
         log::warn!("removing corrupted cached pack {}", path.display());
         std::fs::remove_file(path).at(path)?;
@@ -175,10 +174,7 @@ pub fn validate_cached_pack(
     }
 
     if let Err(error) = PackReader::open(path) {
-        log::warn!(
-            "removing invalid cached pack {}: {error}",
-            path.display()
-        );
+        log::warn!("removing invalid cached pack {}: {error}", path.display());
         std::fs::remove_file(path).at(path)?;
         return Ok(false);
     }

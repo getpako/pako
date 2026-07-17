@@ -100,9 +100,9 @@ pub fn validate_managed_name(value: &str, field: &str) -> Result<()> {
         && value.len() <= 128
         && value != "."
         && value != ".."
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
         && !value.starts_with('.')
         && !value.ends_with('.');
 
@@ -134,7 +134,9 @@ pub fn validate_symlink_target(link: &PackagePath, target: &str) -> Result<()> {
         return Err(Error::InvalidPackagePath(target.to_owned()));
     }
 
-    let mut depth = link.parent().map_or(0, |parent| parent.components().count());
+    let mut depth = link
+        .parent()
+        .map_or(0, |parent| parent.components().count());
 
     for component in Path::new(target).components() {
         match component {

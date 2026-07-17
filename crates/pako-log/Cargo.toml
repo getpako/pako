@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+indicatif.workspace = true
 log.workspace = true
 
 [lints]

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use pako_core::Sha256Digest;
 use reqwest::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE},
@@ -59,6 +59,20 @@ pub trait Registry: Send + Sync {
         &self,
         reference: &OciReference,
         source: &Path,
+    ) -> anyhow::Result<Sha256Digest>;
+
+    async fn push_blob_with_progress(
+        &self,
+        reference: &OciReference,
+        source: &Path,
+        progress: &ProgressBar,
+    ) -> anyhow::Result<Sha256Digest>;
+
+    async fn push_blob_impl(
+        &self,
+        reference: &OciReference,
+        source: &Path,
+        shared_progress: Option<&ProgressBar>,
     ) -> anyhow::Result<Sha256Digest>;
 
     async fn push_manifest(
@@ -277,14 +291,7 @@ impl Registry for OciClient {
             .truncate(!append)
             .open(&partial)
             .await?;
-        let content_length = response.content_length();
-        let local_progress = shared_progress.is_none().then(|| {
-            transfer_progress(
-                "downloading blob",
-                content_length.map(|length| if append { offset + length } else { length }),
-            )
-        });
-        let progress = shared_progress.or(local_progress.as_ref());
+        let progress = shared_progress;
         if append {
             if let Some(progress) = progress {
                 progress.inc(offset);
@@ -310,9 +317,6 @@ impl Registry for OciClient {
 
         tokio::fs::rename(partial, destination).await?;
         log::debug!("verified downloaded blob {digest}");
-        if let Some(progress) = local_progress {
-            progress.finish_with_message("downloaded blob");
-        }
         Ok(())
     }
 
@@ -320,6 +324,25 @@ impl Registry for OciClient {
         &self,
         reference: &OciReference,
         source: &Path,
+    ) -> anyhow::Result<Sha256Digest> {
+        self.push_blob_impl(reference, source, None).await
+    }
+
+    /// Push a blob while contributing bytes to a caller-owned progress bar.
+    async fn push_blob_with_progress(
+        &self,
+        reference: &OciReference,
+        source: &Path,
+        progress: &ProgressBar,
+    ) -> anyhow::Result<Sha256Digest> {
+        self.push_blob_impl(reference, source, Some(progress)).await
+    }
+
+    async fn push_blob_impl(
+        &self,
+        reference: &OciReference,
+        source: &Path,
+        shared_progress: Option<&ProgressBar>,
     ) -> anyhow::Result<Sha256Digest> {
         let mut file = File::open(source).await?;
         let mut data = Vec::new();
@@ -332,6 +355,9 @@ impl Registry for OciClient {
             .send()
             .await?;
         if exists.status().is_success() {
+            if let Some(progress) = shared_progress {
+                progress.inc(data.len() as u64);
+            }
             return Ok(digest);
         }
 
@@ -355,8 +381,7 @@ impl Registry for OciClient {
             .query_pairs_mut()
             .append_pair("digest", &digest.to_string());
 
-        let progress = transfer_progress("uploading blob", Some(data.len() as u64));
-        let stream_progress = progress.clone();
+        let stream_progress = shared_progress.cloned();
         let stream = futures_util::stream::unfold((data, 0_usize), move |(data, offset)| {
             let progress = stream_progress.clone();
             async move {
@@ -365,22 +390,18 @@ impl Registry for OciClient {
                 }
                 let end = (offset + 1024 * 1024).min(data.len());
                 let chunk = bytes::Bytes::copy_from_slice(&data[offset..end]);
-                progress.inc(chunk.len() as u64);
+                if let Some(progress) = &progress {
+                    progress.inc(chunk.len() as u64);
+                }
                 Some((Ok::<_, std::io::Error>(chunk), (data, end)))
             }
         });
-        let result = self
-            .send_checked(
-                self.authenticate(self.client.put(upload_url))
-                    .header(CONTENT_TYPE, "application/octet-stream")
-                    .body(reqwest::Body::wrap_stream(stream)),
-            )
-            .await;
-        if result.is_err() {
-            progress.abandon_with_message("blob upload failed");
-        }
-        result?;
-        progress.finish_with_message("uploaded blob");
+        self.send_checked(
+            self.authenticate(self.client.put(upload_url))
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(reqwest::Body::wrap_stream(stream)),
+        )
+        .await?;
 
         Ok(digest)
     }
@@ -406,22 +427,6 @@ impl Registry for OciClient {
 
         Ok(digest)
     }
-}
-
-fn transfer_progress(message: &str, total: Option<u64>) -> ProgressBar {
-    let progress = total.map_or_else(ProgressBar::new_spinner, ProgressBar::new);
-    let style = match total {
-        Some(_) => ProgressStyle::with_template(
-            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-        ),
-        None => ProgressStyle::with_template("{spinner:.green} {msg} {bytes} ({bytes_per_sec})"),
-    }
-    .expect("OCI transfer progress template is valid")
-    .progress_chars("#>-");
-    progress.set_style(style);
-    progress.set_message(message.to_owned());
-    progress.enable_steady_tick(std::time::Duration::from_millis(100));
-    progress
 }
 
 async fn hash_file(path: &Path) -> anyhow::Result<Sha256Digest> {

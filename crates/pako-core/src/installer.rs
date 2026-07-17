@@ -232,10 +232,8 @@ impl Installer {
 
         let manifest = self.load_manifest(package, &target_version)?;
         verify::verify_tree_with_jobs(&manifest, &target_path, self.jobs)?;
-        let active_receipt =
-            Receipt::load(&self.layout.version_record(package, &active_version)?)?;
-        let target_receipt =
-            Receipt::load(&self.layout.version_record(package, &target_version)?)?;
+        let active_receipt = Receipt::load(&self.layout.version_record(package, &active_version)?)?;
+        let target_receipt = Receipt::load(&self.layout.version_record(package, &target_version)?)?;
         let transaction_id = format!("rollback-{package}-{}", now_seconds());
         let mut exposures = integrations::ExposureTransaction::begin(&self.layout, transaction_id)?;
         exposures.preflight(

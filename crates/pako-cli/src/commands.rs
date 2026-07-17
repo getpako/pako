@@ -25,10 +25,9 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
 
     if cli.mutates_package_state() {
         let recovery_layout = layout.clone();
-        let recovered = tokio::task::spawn_blocking(move || {
-            pako_core::transaction::recover(&recovery_layout)
-        })
-        .await??;
+        let recovered =
+            tokio::task::spawn_blocking(move || pako_core::transaction::recover(&recovery_layout))
+                .await??;
         if !recovered.is_empty() {
             ui.warning(format!(
                 "recovered {} interrupted transaction(s) before continuing",
@@ -71,10 +70,9 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
             let step = ui.spinner(format!("Verifying {package}"));
             let local_installer = installer.clone();
             let verify_package = package.clone();
-            let report = tokio::task::spawn_blocking(move || {
-                local_installer.verify(&verify_package)
-            })
-            .await??;
+            let report =
+                tokio::task::spawn_blocking(move || local_installer.verify(&verify_package))
+                    .await??;
             step.finish(format!(
                 "Verified {package}: {} files, {} directories, {} symlinks",
                 report.files, report.directories, report.symlinks
@@ -117,7 +115,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
             let state = installer.versions(&arguments.package)?;
             for version in state.history {
                 let marker = if version == state.active { "*" } else { " " };
-                println!("{marker} {version}");
+                pako_log::suspend_progress(|| println!("{marker} {version}"));
             }
         }
         Command::Prune(arguments) => {
@@ -151,10 +149,9 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
             let step = ui.spinner(format!("Pruning retained versions of {package}"));
             let local_installer = installer.clone();
             let prune_package = package.clone();
-            let removed = tokio::task::spawn_blocking(move || {
-                local_installer.prune(&prune_package, keep)
-            })
-            .await??;
+            let removed =
+                tokio::task::spawn_blocking(move || local_installer.prune(&prune_package, keep))
+                    .await??;
             step.finish(format!("Pruned {} retained version(s)", removed.len()));
         }
         Command::Remove(arguments) => {
@@ -309,7 +306,10 @@ fn print_remote_plan(plan: &RemoteInstallPlan, layout: &Layout, ui: Ui) -> anyho
         ui.field("Rollback", "previous version will be retained");
     }
     if plan.download.overfetch_bytes() > 0 {
-        ui.field("Pack overfetch", format_size(plan.download.overfetch_bytes()));
+        ui.field(
+            "Pack overfetch",
+            format_size(plan.download.overfetch_bytes()),
+        );
     }
     Ok(())
 }
@@ -333,14 +333,16 @@ fn list_receipts(layout: &Layout) -> anyhow::Result<()> {
 
     receipts.sort_by(|left, right| left.0.package.cmp(&right.0.package));
     for (state, receipt) in receipts {
-        println!(
-            "{}\t{}-{}\t{}\t{}",
-            receipt.package,
-            receipt.upstream_version,
-            receipt.release,
-            receipt.target,
-            state.channel,
-        );
+        pako_log::suspend_progress(|| {
+            println!(
+                "{}\t{}-{}\t{}\t{}",
+                receipt.package,
+                receipt.upstream_version,
+                receipt.release,
+                receipt.target,
+                state.channel,
+            );
+        });
     }
     Ok(())
 }
@@ -352,14 +354,16 @@ fn status(layout: &Layout, package: Option<&str>) -> anyhow::Result<()> {
 
     let state = PackageState::load(&layout.package_state(package)?)?;
     let receipt = Receipt::load(&layout.version_record(package, &state.active)?)?;
-    println!(
-        "{} {}-{} ({}, channel {})",
-        receipt.package,
-        receipt.upstream_version,
-        receipt.release,
-        receipt.target,
-        state.channel,
-    );
+    pako_log::suspend_progress(|| {
+        println!(
+            "{} {}-{} ({}, channel {})",
+            receipt.package,
+            receipt.upstream_version,
+            receipt.release,
+            receipt.target,
+            state.channel,
+        );
+    });
     Ok(())
 }
 

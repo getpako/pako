@@ -88,7 +88,10 @@ fn smoke(context: &Context) -> Result<()> {
     let recipe = context.root().join("examples/hello-local/recipe.toml");
     let published = publish_recipe(context, &recipe, None)?;
 
-    run_pako(context, &["-y".into(), "install".into(), published.package.clone()])?;
+    run_pako(
+        context,
+        &["-y".into(), "install".into(), published.package.clone()],
+    )?;
     run_pako(context, &["verify".into(), published.package.clone()])?;
 
     let launcher = context.client().join("home/.local/bin/hello-pako");

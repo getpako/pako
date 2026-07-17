@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use futures_util::{stream, StreamExt};
@@ -84,21 +87,35 @@ pub(crate) async fn publish(
         descriptor(PACK_INDEX_MEDIA_TYPE, index_digest, &artifacts.pack_index)?,
     ];
     let pack_count = artifacts.packs.len();
-    let progress = pack_progress("uploading packs", pack_count);
+    let upload_bytes =
+        artifacts
+            .packs
+            .values()
+            .try_fold(0_u64, |total, path| -> anyhow::Result<u64> {
+                total
+                    .checked_add(std::fs::metadata(path)?.len())
+                    .ok_or_else(|| anyhow::anyhow!("pack upload size overflow"))
+            })?;
+    let progress = pack_upload_progress(pack_count, upload_bytes);
+    let completed_packs = Arc::new(AtomicUsize::new(0));
     let upload_jobs = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(6);
     let upload_client = client.clone();
     let upload_reference = reference.clone();
     let upload_progress = progress.clone();
+    let upload_completed = Arc::clone(&completed_packs);
     let uploads = stream::iter(artifacts.packs.iter().map(move |(digest, path)| {
         let digest = *digest;
         let path = path.clone();
         let progress = upload_progress.clone();
+        let completed = Arc::clone(&upload_completed);
         let client = upload_client.clone();
         let reference = upload_reference.clone();
         async move {
-            let uploaded = push_checked_blob(&client, &reference, &path, digest).await?;
+            let uploaded =
+                push_checked_blob_with_progress(&client, &reference, &path, digest, &progress)
+                    .await?;
             if uploaded != digest {
                 anyhow::bail!(
                     "pack filename digest does not match its contents: {}",
@@ -106,7 +123,9 @@ pub(crate) async fn publish(
                 );
             }
             let layer = descriptor(PACK_MEDIA_TYPE, uploaded, &path)?;
-            progress.inc(1);
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            progress.set_prefix(format!("{done}/{pack_count} packs"));
+            log::debug!("uploaded pack {digest} ({done}/{pack_count})");
             Ok::<_, anyhow::Error>((digest, layer))
         }
     }))
@@ -114,12 +133,20 @@ pub(crate) async fn publish(
 
     futures_util::pin_mut!(uploads);
     let mut pack_layers = BTreeMap::new();
-    while let Some(result) = uploads.next().await {
-        let (digest, layer) = result?;
-        pack_layers.insert(digest, layer);
+    let upload_result = async {
+        while let Some(result) = uploads.next().await {
+            let (digest, layer) = result?;
+            pack_layers.insert(digest, layer);
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = upload_result {
+        pako_log::abandon_progress(&progress, "Pack upload failed");
+        return Err(error);
     }
     layers.extend(pack_layers.into_values());
-    progress.finish_with_message(format!("uploaded {pack_count} packs"));
+    pako_log::finish_progress(&progress, format!("Uploaded {pack_count} packs"));
 
     let manifest = ImageManifest {
         schema_version: 2,
@@ -256,8 +283,7 @@ impl Artifacts {
                     let path = directory
                         .join("packs")
                         .join(format!("{}.pakopack", digest.hex()));
-                    let result = verify_pack_artifact(&path, digest, size)
-                        .map(|()| (digest, path));
+                    let result = verify_pack_artifact(&path, digest, size).map(|()| (digest, path));
                     progress.inc(1);
                     results
                         .lock()
@@ -271,9 +297,16 @@ impl Artifacts {
             .into_inner()
             .expect("pack verification result lock poisoned")
             .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<anyhow::Result<Vec<_>>>();
+        let verified = match verified {
+            Ok(verified) => verified,
+            Err(error) => {
+                pako_log::abandon_progress(&progress, "Pack verification failed");
+                return Err(error);
+            }
+        };
         let packs = verified.into_iter().collect::<BTreeMap<_, _>>();
-        progress.finish_with_message(format!("verified {pack_count} packs"));
+        pako_log::finish_progress(&progress, format!("Verified {pack_count} packs"));
         Ok(Self {
             manifest,
             package_manifest,
@@ -300,8 +333,22 @@ fn verify_pack_artifact(
     Ok(())
 }
 
+fn pack_upload_progress(pack_count: usize, total_bytes: u64) -> ProgressBar {
+    let progress = pako_log::add_progress(ProgressBar::new(total_bytes));
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta}) {prefix}",
+    )
+    .expect("pack upload progress template is valid")
+    .progress_chars("#>-");
+    progress.set_style(style);
+    progress.set_message("Uploading packs");
+    progress.set_prefix(format!("0/{pack_count} packs"));
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
+    progress
+}
+
 fn pack_progress(message: &str, pack_count: usize) -> ProgressBar {
-    let progress = ProgressBar::new(pack_count as u64);
+    let progress = pako_log::add_progress(ProgressBar::new(pack_count as u64));
     let style = ProgressStyle::with_template(
         "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} packs ({per_sec})",
     )
@@ -320,6 +367,25 @@ async fn push_checked_blob(
     expected: Sha256Digest,
 ) -> anyhow::Result<Sha256Digest> {
     let actual = client.push_blob(reference, path).await?;
+    if actual != expected {
+        anyhow::bail!(
+            "registry returned an unexpected blob digest for {}",
+            path.display()
+        );
+    }
+    Ok(actual)
+}
+
+async fn push_checked_blob_with_progress(
+    client: &OciClient,
+    reference: &OciReference,
+    path: &Path,
+    expected: Sha256Digest,
+    progress: &ProgressBar,
+) -> anyhow::Result<Sha256Digest> {
+    let actual = client
+        .push_blob_with_progress(reference, path, progress)
+        .await?;
     if actual != expected {
         anyhow::bail!(
             "registry returned an unexpected blob digest for {}",

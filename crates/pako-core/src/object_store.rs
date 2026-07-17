@@ -76,7 +76,9 @@ impl ObjectStore {
                 break;
             }
 
-            output.write_all(&buffer[..count]).map_err(anyhow::Error::from)?;
+            output
+                .write_all(&buffer[..count])
+                .map_err(anyhow::Error::from)?;
             chunk_hash.update(&buffer[..count]);
             file_hash.update(&buffer[..count]);
             total = total

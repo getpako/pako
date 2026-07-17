@@ -4,8 +4,12 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
-    canonical, error::IoContext, manifest::validate_package_name,
-    path::{validate_channel, validate_local_version, validate_managed_name, validate_upstream_version},
+    canonical,
+    error::IoContext,
+    manifest::validate_package_name,
+    path::{
+        validate_channel, validate_local_version, validate_managed_name, validate_upstream_version,
+    },
     Error, Result, Sha256Digest,
 };
 

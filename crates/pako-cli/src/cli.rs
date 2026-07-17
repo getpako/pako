@@ -414,7 +414,10 @@ impl Cli {
             Command::Status(arguments) => ("status", arguments.package.as_deref()),
             Command::Recover => ("recover", None),
         };
-        package.map_or_else(|| operation.to_owned(), |package| format!("{operation}-{package}"))
+        package.map_or_else(
+            || operation.to_owned(),
+            |package| format!("{operation}-{package}"),
+        )
     }
 
     pub(crate) fn mutates_package_state(&self) -> bool {

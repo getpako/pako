@@ -263,7 +263,7 @@ async fn main() {
 
     if let Err(error) = run(cli).await {
         log::error!("{error:#}");
-        eprintln!("details: {}", log.path().display());
+        pako_log::suspend_progress(|| eprintln!("details: {}", log.path().display()));
         std::process::exit(1);
     }
 }
@@ -274,10 +274,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             log::info!("validating recipe {}", arguments.recipe.display());
             let recipe = recipe::Recipe::load(&arguments.recipe)?;
             recipe.validate()?;
-            println!(
-                "recipe is valid: {} {}",
-                recipe.package.name, recipe.package.version
-            );
+            pako_log::suspend_progress(|| {
+                println!(
+                    "recipe is valid: {} {}",
+                    recipe.package.name, recipe.package.version
+                );
+            });
         }
         Command::Build(arguments) => {
             log::info!(
@@ -294,13 +296,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .build(&recipe, &arguments.target)
                 .await?;
 
-            println!(
-                "built {} {} for {}",
-                report.package, report.version, report.target
-            );
-            println!("output: {}", report.output.display());
-            println!("manifest: {}", report.package_manifest.display());
-            println!("pack index: {}", report.pack_index.display());
+            pako_log::suspend_progress(|| {
+                println!(
+                    "built {} {} for {}",
+                    report.package, report.version, report.target
+                );
+                println!("output: {}", report.output.display());
+                println!("manifest: {}", report.package_manifest.display());
+                println!("pack index: {}", report.pack_index.display());
+            });
         }
         Command::Publish(arguments) => {
             log::info!(
@@ -332,14 +336,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             )
             .await?;
-            println!("published OCI image index: {digest}");
-            println!("updated signed TUF catalog: {}", arguments.tuf.display());
+            pako_log::suspend_progress(|| {
+                println!("published OCI image index: {digest}");
+                println!("updated signed TUF catalog: {}", arguments.tuf.display());
+            });
         }
         Command::Tuf(arguments) => match arguments.command {
             TufCommand::Init { directory } => {
                 log::info!("initializing TUF repository {}", directory.display());
                 tuf::init(&directory).await?;
-                println!("initialized local TUF repository: {}", directory.display());
+                pako_log::suspend_progress(|| {
+                    println!("initialized local TUF repository: {}", directory.display());
+                });
             }
         },
     }
