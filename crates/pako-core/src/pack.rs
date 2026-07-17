@@ -141,6 +141,51 @@ pub struct PackReader {
     file_len: u64,
 }
 
+/// Validate one cached immutable pack against its descriptor and pack format.
+///
+/// Invalid cache entries are removed and reported as missing so the caller can
+/// download a clean copy under the same content digest.
+pub fn validate_cached_pack(
+    path: &Path,
+    expected_digest: Sha256Digest,
+    expected_size: u64,
+) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let metadata = std::fs::metadata(path).at(path)?;
+    if metadata.len() != expected_size {
+        log::warn!(
+            "removing cached pack {} with unexpected size {} (expected {})",
+            path.display(),
+            metadata.len(),
+            expected_size
+        );
+        std::fs::remove_file(path).at(path)?;
+        return Ok(false);
+    }
+
+    let (actual_digest, actual_size) =
+        Sha256Digest::calculate_reader(File::open(path).at(path)?)?;
+    if actual_size != expected_size || actual_digest != expected_digest {
+        log::warn!("removing corrupted cached pack {}", path.display());
+        std::fs::remove_file(path).at(path)?;
+        return Ok(false);
+    }
+
+    if let Err(error) = PackReader::open(path) {
+        log::warn!(
+            "removing invalid cached pack {}: {error}",
+            path.display()
+        );
+        std::fs::remove_file(path).at(path)?;
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
 impl PackReader {
     /// Open and validate the complete pack index before exposing any chunk.
     pub fn open(path: &Path) -> Result<Self> {

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     fs::File,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Mutex,
 };
@@ -11,8 +11,9 @@ use indicatif::ProgressBar;
 
 use pako_core::{
     installer::{InstallRequest, Installer},
+    lock::DigestLock,
     manifest::{Entry, PackIndex, PackageManifest},
-    pack::PackReader,
+    pack::{validate_cached_pack, PackReader},
     planner,
     receipt::{PackageState, Receipt},
     Sha256Digest,
@@ -22,7 +23,7 @@ use pako_trust::TrustedRepository;
 use serde::Deserialize;
 use url::Url;
 
-use crate::output::Ui;
+use crate::{cli::Concurrency, output::Ui};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -71,6 +72,7 @@ pub(crate) struct RemoteInstallPlan {
     pub(crate) launcher_count: usize,
     pub(crate) desktop_entry_count: usize,
     pub(crate) icon_count: usize,
+    download_jobs: usize,
     client: OciClient,
     platform_reference: OciReference,
     pack_index: PackIndex,
@@ -106,6 +108,7 @@ pub(crate) async fn resolve_remote(
     package: &str,
     channel: &str,
     operation: PackageOperation,
+    concurrency: Concurrency,
     ui: Ui,
 ) -> anyhow::Result<RemoteInstallPlan> {
     pako_core::path::validate_channel(channel)?;
@@ -157,8 +160,15 @@ pub(crate) async fn resolve_remote(
     pack_index.validate_against(&manifest)?;
     package_step.finish("Package metadata verified");
 
-    let available = collect_available_chunks(installer, &pack_index, ui)?;
-    let download = planner::plan(&pack_index, &available)?;
+    let available = collect_available_chunks(installer, &pack_index, concurrency.cpu_jobs, ui)?;
+    let cached_packs = collect_cached_packs(
+        installer,
+        &pack_index,
+        &available,
+        concurrency.cpu_jobs,
+        ui,
+    )?;
+    let download = planner::plan(&pack_index, &available, &cached_packs)?;
     let total_raw_bytes = pack_index
         .chunks
         .values()
@@ -199,6 +209,7 @@ pub(crate) async fn resolve_remote(
         launcher_count: manifest.integrations.launchers.len(),
         desktop_entry_count: manifest.integrations.desktop_entries.len(),
         icon_count: manifest.integrations.icons.len(),
+        download_jobs: concurrency.download_jobs,
         total_chunks: pack_index.chunks.len(),
         available_chunks: available.len(),
         reusable_bytes: total_raw_bytes.saturating_sub(download.required_raw_bytes),
@@ -232,6 +243,7 @@ pub(crate) async fn execute_remote(
             &plan.client,
             &plan.platform_reference,
             &plan.download,
+            plan.download_jobs,
             &progress,
         )
         .await?;
@@ -318,13 +330,28 @@ async fn fetch_package_metadata(
     index_descriptor: &pako_oci::Descriptor,
 ) -> anyhow::Result<(PackageManifest, PackIndex)> {
     let directory = installer.layout().cache.join("metadata");
+    let lock_directory = installer.layout().locks().join("metadata");
     std::fs::create_dir_all(&directory)?;
 
     let package_path = directory.join(package_descriptor.digest.hex());
     let index_path = directory.join(index_descriptor.digest.hex());
     tokio::try_join!(
-        client.fetch_blob(reference, package_descriptor.digest, &package_path),
-        client.fetch_blob(reference, index_descriptor.digest, &index_path),
+        fetch_cached_blob(
+            client,
+            reference,
+            package_descriptor.digest,
+            package_descriptor.size,
+            &package_path,
+            &lock_directory,
+        ),
+        fetch_cached_blob(
+            client,
+            reference,
+            index_descriptor.digest,
+            index_descriptor.size,
+            &index_path,
+            &lock_directory,
+        ),
     )?;
 
     let package_manifest = serde_json::from_reader(File::open(package_path)?)?;
@@ -332,15 +359,60 @@ async fn fetch_package_metadata(
     Ok((package_manifest, pack_index))
 }
 
+async fn fetch_cached_blob(
+    client: &OciClient,
+    reference: &OciReference,
+    digest: Sha256Digest,
+    size: u64,
+    path: &Path,
+    lock_directory: &Path,
+) -> anyhow::Result<()> {
+    let lock_directory = lock_directory.to_owned();
+    let lock = tokio::task::spawn_blocking(move || DigestLock::acquire(&lock_directory, digest))
+        .await??;
+
+    if validate_cached_blob(path, digest, size)? {
+        log::debug!("using verified cached metadata blob {digest}");
+        drop(lock);
+        return Ok(());
+    }
+
+    client.fetch_blob(reference, digest, path).await?;
+    drop(lock);
+    Ok(())
+}
+
+fn validate_cached_blob(
+    path: &Path,
+    expected_digest: Sha256Digest,
+    expected_size: u64,
+) -> anyhow::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let metadata = std::fs::metadata(path)?;
+    let (actual_digest, actual_size) = Sha256Digest::calculate_reader(File::open(path)?)?;
+    if metadata.len() == expected_size
+        && actual_size == expected_size
+        && actual_digest == expected_digest
+    {
+        return Ok(true);
+    }
+
+    log::warn!("removing corrupted metadata cache entry {}", path.display());
+    std::fs::remove_file(path)?;
+    Ok(false)
+}
+
 fn collect_available_chunks(
     installer: &Installer,
     index: &PackIndex,
+    worker_limit: usize,
     ui: Ui,
 ) -> anyhow::Result<BTreeSet<Sha256Digest>> {
     let digests = index.chunks.keys().copied().collect::<Vec<_>>();
-    let worker_count = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(digests.len().max(1));
+    let worker_count = worker_limit.max(1).min(digests.len().max(1));
     let progress = ui.item_progress("Checking local chunk cache", digests.len(), "chunks");
     let queue = Mutex::new(VecDeque::from(digests));
     let results = Mutex::new(Vec::new());
@@ -381,26 +453,115 @@ fn collect_available_chunks(
         .collect())
 }
 
+fn collect_cached_packs(
+    installer: &Installer,
+    index: &PackIndex,
+    available_chunks: &BTreeSet<Sha256Digest>,
+    worker_limit: usize,
+    ui: Ui,
+) -> anyhow::Result<BTreeSet<Sha256Digest>> {
+    let required = index
+        .chunks
+        .iter()
+        .filter(|(digest, _)| !available_chunks.contains(digest))
+        .map(|(_, location)| location.pack)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|digest| (digest, index.packs[&digest].size))
+        .collect::<Vec<_>>();
+
+    if required.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let progress = ui.item_progress("Checking local pack cache", required.len(), "packs");
+    let worker_count = worker_limit.max(1).min(required.len());
+    let queue = Mutex::new(VecDeque::from(required));
+    let results = Mutex::new(Vec::new());
+    let packs_root = installer.layout().packs();
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue = &queue;
+            let results = &results;
+            let progress = progress.clone();
+            let packs_root = packs_root.clone();
+            scope.spawn(move || loop {
+                let Some((digest, size)) = queue
+                    .lock()
+                    .expect("pack check queue lock poisoned")
+                    .pop_front()
+                else {
+                    return;
+                };
+                let path = packs_root.join(format!("{}.pakopack", digest.hex()));
+                let result = validate_cached_pack(&path, digest, size)
+                    .map(|present| (digest, present));
+                progress.inc(1);
+                results
+                    .lock()
+                    .expect("pack check result lock poisoned")
+                    .push(result);
+            });
+        }
+    });
+
+    let checked = results
+        .into_inner()
+        .expect("pack check result lock poisoned")
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    progress.finish_with_message("Checked local pack cache");
+    Ok(checked
+        .into_iter()
+        .filter_map(|(digest, present)| present.then_some(digest))
+        .collect())
+}
+
 async fn download_missing_chunks(
     installer: &Installer,
     client: &OciClient,
     reference: &OciReference,
     plan: &planner::DownloadPlan,
+    download_jobs: usize,
     progress: &ProgressBar,
 ) -> anyhow::Result<()> {
-    let jobs = std::thread::available_parallelism().map_or(1, usize::from);
-    let downloads = stream::iter(plan.packs.iter().cloned().map(|planned_pack| {
-        let pack_path = installer
-            .layout()
-            .packs()
-            .join(format!("{}.pakopack", planned_pack.digest.hex()));
-        async move {
-            client
-                .fetch_blob_with_progress(reference, planned_pack.digest, &pack_path, progress)
-                .await
-        }
-    }))
-    .buffer_unordered(jobs);
+    let packs_root = installer.layout().packs();
+    let lock_root = installer.layout().locks().join("packs");
+    let downloads = stream::iter(
+        plan.packs
+            .iter()
+            .filter(|pack| !pack.cached)
+            .cloned()
+            .map(|planned_pack| {
+                let pack_path =
+                    packs_root.join(format!("{}.pakopack", planned_pack.digest.hex()));
+                let lock_root = lock_root.clone();
+                let progress = progress.clone();
+                async move {
+                    let digest = planned_pack.digest;
+                    let size = planned_pack.size;
+                    let lock = tokio::task::spawn_blocking(move || {
+                        DigestLock::acquire(&lock_root, digest)
+                    })
+                    .await??;
+
+                    if validate_cached_pack(&pack_path, digest, size)? {
+                        log::info!("pack {digest} was completed by another Pako process");
+                        progress.inc(size);
+                        drop(lock);
+                        return Ok::<(), anyhow::Error>(());
+                    }
+
+                    client
+                        .fetch_blob_with_progress(reference, digest, &pack_path, &progress)
+                        .await?;
+                    drop(lock);
+                    Ok::<(), anyhow::Error>(())
+                }
+            }),
+    )
+    .buffer_unordered(download_jobs.max(1));
 
     futures_util::pin_mut!(downloads);
     while let Some(result) = downloads.next().await {
@@ -408,10 +569,7 @@ async fn download_missing_chunks(
     }
 
     for planned_pack in &plan.packs {
-        let pack_path = installer
-            .layout()
-            .packs()
-            .join(format!("{}.pakopack", planned_pack.digest.hex()));
+        let pack_path = packs_root.join(format!("{}.pakopack", planned_pack.digest.hex()));
         let mut reader = PackReader::open(&pack_path)?;
         for digest in &planned_pack.needed_chunks {
             let mut temporary = installer

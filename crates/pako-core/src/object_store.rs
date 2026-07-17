@@ -7,17 +7,18 @@ use std::{
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::{error::IoContext, Error, Result, Sha256Digest};
+use crate::{error::IoContext, lock::DigestLock, Error, Result, Sha256Digest};
 
 /// Local content-addressed store for verified raw chunks.
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
     root: PathBuf,
+    lock_root: PathBuf,
 }
 
 impl ObjectStore {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub fn new(root: PathBuf, lock_root: PathBuf) -> Self {
+        Self { root, lock_root }
     }
 
     pub fn root(&self) -> &Path {
@@ -59,6 +60,7 @@ impl ObjectStore {
 
     /// Import one raw object using an atomic no-clobber publish operation.
     pub fn import(&self, mut reader: impl Read, expected: Sha256Digest) -> Result<PathBuf> {
+        let _lock = DigestLock::acquire(&self.lock_root, expected)?;
         let destination = self.path(expected);
         if self.contains(expected)? {
             log::trace!("object {expected} is already present");

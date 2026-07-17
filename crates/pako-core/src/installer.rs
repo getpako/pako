@@ -36,7 +36,7 @@ pub struct Installer {
 impl Installer {
     pub fn new(layout: Layout) -> Result<Self> {
         layout.ensure()?;
-        let store = ObjectStore::new(layout.objects());
+        let store = ObjectStore::new(layout.objects(), layout.locks().join("objects"));
         Ok(Self { layout, store })
     }
 

@@ -16,17 +16,35 @@ pub struct PlannedPack {
     pub size: u64,
     pub needed_chunks: Vec<Sha256Digest>,
     pub useful_stored_bytes: u64,
+    pub cached: bool,
 }
 
 impl DownloadPlan {
     pub fn overfetch_bytes(&self) -> u64 {
-        let useful_bytes = self.packs.iter().map(|pack| pack.useful_stored_bytes).sum();
+        let useful_bytes = self
+            .packs
+            .iter()
+            .filter(|pack| !pack.cached)
+            .map(|pack| pack.useful_stored_bytes)
+            .sum();
         self.network_bytes.saturating_sub(useful_bytes)
+    }
+
+    pub fn packs_to_download(&self) -> usize {
+        self.packs.iter().filter(|pack| !pack.cached).count()
+    }
+
+    pub fn cached_packs(&self) -> usize {
+        self.packs.iter().filter(|pack| pack.cached).count()
     }
 }
 
 /// Select the minimum set of immutable packs needed for missing chunks.
-pub fn plan(index: &PackIndex, locally_available: &BTreeSet<Sha256Digest>) -> Result<DownloadPlan> {
+pub fn plan(
+    index: &PackIndex,
+    locally_available: &BTreeSet<Sha256Digest>,
+    cached_packs: &BTreeSet<Sha256Digest>,
+) -> Result<DownloadPlan> {
     let missing_chunks: BTreeSet<_> = index
         .chunks
         .keys()
@@ -49,6 +67,7 @@ pub fn plan(index: &PackIndex, locally_available: &BTreeSet<Sha256Digest>) -> Re
             size: pack_size,
             needed_chunks: Vec::new(),
             useful_stored_bytes: 0,
+            cached: cached_packs.contains(&location.pack),
         });
 
         planned.needed_chunks.push(*digest);
@@ -59,7 +78,11 @@ pub fn plan(index: &PackIndex, locally_available: &BTreeSet<Sha256Digest>) -> Re
     }
 
     let packs: Vec<_> = by_pack.into_values().collect();
-    let network_bytes = packs.iter().map(|pack| pack.size).sum();
+    let network_bytes = packs
+        .iter()
+        .filter(|pack| !pack.cached)
+        .try_fold(0_u64, |total, pack| total.checked_add(pack.size))
+        .ok_or_else(|| anyhow::anyhow!("plan network size overflow"))?;
 
     Ok(DownloadPlan {
         missing_chunks,

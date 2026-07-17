@@ -199,6 +199,19 @@ pub(crate) struct Cli {
     #[arg(short = 'y', long, global = true)]
     pub(crate) yes: bool,
 
+    /// Maximum number of CPU and filesystem workers.
+    ///
+    /// The default is the number of logical CPUs reported by the operating
+    /// system. Network transfers have a separate, lower default limit.
+    #[arg(long, value_name = "JOBS", global = true)]
+    pub(crate) jobs: Option<NonZeroUsize>,
+
+    /// Maximum number of concurrent registry blob downloads.
+    ///
+    /// The default is the smaller of six and the selected CPU worker count.
+    #[arg(long, value_name = "JOBS", global = true)]
+    pub(crate) download_jobs: Option<NonZeroUsize>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -367,7 +380,27 @@ pub(crate) struct StatusArgs {
     pub(crate) package: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Concurrency {
+    pub(crate) cpu_jobs: usize,
+    pub(crate) download_jobs: usize,
+}
+
 impl Cli {
+    pub(crate) fn concurrency(&self) -> Concurrency {
+        let cpu_jobs = self.jobs.map_or_else(
+            || std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+            NonZeroUsize::get,
+        );
+        let download_jobs = self
+            .download_jobs
+            .map_or_else(|| cpu_jobs.min(6), NonZeroUsize::get);
+        Concurrency {
+            cpu_jobs,
+            download_jobs,
+        }
+    }
+
     pub(crate) fn operation_log_name(&self) -> String {
         let (operation, package) = match &self.command {
             Command::Install(arguments) => ("install", Some(arguments.package.as_str())),

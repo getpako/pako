@@ -7,6 +7,7 @@ pub mod error;
 pub mod installer;
 pub mod integrations;
 pub mod layout;
+pub mod lock;
 pub mod manifest;
 pub mod materialize;
 pub mod object_store;

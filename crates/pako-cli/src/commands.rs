@@ -20,6 +20,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
     layout.ensure()?;
     let installer = Installer::new(layout.clone())?;
     let ui = Ui::new(cli.yes);
+    let concurrency = cli.concurrency();
 
     if cli.mutates_package_state() {
         let recovered = pako_core::transaction::recover(&layout)?;
@@ -40,6 +41,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
                 &arguments.channel,
                 PackageOperation::Install,
                 false,
+                concurrency,
                 ui,
             )
             .await?;
@@ -54,6 +56,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
                 channel,
                 PackageOperation::Upgrade,
                 arguments.dry_run,
+                concurrency,
                 ui,
             )
             .await?;
@@ -174,9 +177,10 @@ async fn install_or_upgrade(
     channel: &str,
     operation: PackageOperation,
     dry_run: bool,
+    concurrency: crate::cli::Concurrency,
     ui: Ui,
 ) -> anyhow::Result<()> {
-    let plan = resolve_remote(installer, package, channel, operation, ui).await?;
+    let plan = resolve_remote(installer, package, channel, operation, concurrency, ui).await?;
     print_remote_plan(&plan, layout, ui)?;
 
     if plan.up_to_date {
@@ -234,9 +238,15 @@ fn print_remote_plan(plan: &RemoteInstallPlan, layout: &Layout, ui: Ui) -> anyho
         format!(
             "{} in {} pack(s)",
             format_size(plan.download.network_bytes),
-            plan.download.packs.len()
+            plan.download.packs_to_download()
         ),
     );
+    if plan.download.cached_packs() > 0 {
+        ui.field(
+            "Pack cache",
+            format!("{} verified pack(s)", plan.download.cached_packs()),
+        );
+    }
     ui.field(
         "Local reuse",
         format!(
