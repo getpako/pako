@@ -11,6 +11,7 @@ use crate::{
     error::IoContext,
     integrations::{self, PreparedExposure},
     layout::Layout,
+    manifest::validate_package_name,
     receipt::{sync_directory, PackageState, Receipt},
     Error, Result,
 };
@@ -73,6 +74,7 @@ pub struct PackageLock {
 
 impl PackageLock {
     pub fn acquire(layout: &Layout, package: &str) -> Result<Self> {
+        validate_package_name(package)?;
         let directory = layout.locks();
         std::fs::create_dir_all(&directory).at(&directory)?;
 
@@ -181,6 +183,7 @@ fn validate_journal(layout: &Layout, journal: &Journal) -> Result<()> {
 
     if let Some(commit) = &journal.commit {
         commit.receipt.validate()?;
+        commit.state.validate()?;
         if commit.receipt.package != journal.package {
             return Err(Error::Transaction(
                 "journal receipt has another package".into(),

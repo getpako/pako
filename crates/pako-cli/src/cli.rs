@@ -45,12 +45,10 @@ Examples:
 
   Install from another signed release channel:
     pako install intellij-idea --channel beta
-
-  Print machine-readable command output:
-    pako --json install vscodium";
+";
 
 const UPGRADE_LONG_ABOUT: &str = "\
-Upgrade a package to the release currently published in the stable channel.
+Upgrade a package using its locally remembered release channel.
 
 The command uses the same transactional pipeline as installation. Existing
 chunks are reused from the local object store, only missing pack data is
@@ -85,10 +83,7 @@ the installation unchanged.";
 const VERIFY_AFTER_HELP: &str = "\
 Examples:
   Verify one installed package:
-    pako verify intellij-idea
-
-  Return the verification report as JSON:
-    pako --json verify intellij-idea";
+    pako verify intellij-idea";
 
 const ROLLBACK_LONG_ABOUT: &str = "\
 Activate a previously installed version of a package.
@@ -140,10 +135,7 @@ package name, active version, release number, and target architecture.";
 const LIST_AFTER_HELP: &str = "\
 Examples:
   List installed packages:
-    pako list
-
-  Return the receipt list as JSON:
-    pako --json list";
+    pako list";
 
 const STATUS_LONG_ABOUT: &str = "\
 Show locally recorded package status.
@@ -162,10 +154,7 @@ Examples:
     pako status intellij-idea
 
   Show all installed packages:
-    pako status
-
-  Return one complete receipt as JSON:
-    pako --json status intellij-idea";
+    pako status";
 
 const RECOVER_LONG_ABOUT: &str = "\
 Recover interrupted local package transactions.
@@ -181,10 +170,7 @@ or activation is attempted. Successfully handled journals are removed.";
 const RECOVER_AFTER_HELP: &str = "\
 Examples:
   Recover all interrupted transactions:
-    pako recover
-
-  Return the recovered package names as JSON:
-    pako --json recover";
+    pako recover";
 
 /// Pako command-line interface.
 #[derive(Debug, Parser)]
@@ -198,14 +184,6 @@ Examples:
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {
-    /// Print machine-readable JSON instead of the normal human-readable result.
-    ///
-    /// Diagnostic messages and fatal errors are still written to standard
-    /// error. Commands which stream progress may also use standard error for
-    /// progress reporting.
-    #[arg(long, global = true)]
-    pub(crate) json: bool,
-
     /// Confirm destructive prompts without reading from standard input.
     ///
     /// This currently applies to package removal. It has no effect on
@@ -227,7 +205,7 @@ pub(crate) enum Command {
     )]
     Install(InstallArgs),
 
-    /// Upgrade a package to the current stable release.
+    /// Upgrade a package using its remembered release channel.
     #[command(
         long_about = UPGRADE_LONG_ABOUT,
         after_help = UPGRADE_AFTER_HELP
@@ -309,6 +287,12 @@ pub(crate) struct UpgradeArgs {
     /// Installed package to resolve and upgrade.
     #[arg(value_name = "PACKAGE")]
     pub(crate) package: String,
+
+    /// Override the release channel remembered when the package was installed.
+    ///
+    /// When omitted, Pako reads the channel from the local package state.
+    #[arg(long, value_name = "CHANNEL")]
+    pub(crate) channel: Option<String>,
 
     /// Print the resolved download plan without downloading packs or changing
     /// the active installation.

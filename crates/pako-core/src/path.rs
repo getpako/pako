@@ -90,15 +90,51 @@ impl<'de> Deserialize<'de> for PackagePath {
     }
 }
 
+/// Validate a single path component controlled by package or repository metadata.
+///
+/// This is deliberately stricter than a generic Linux filename. Managed names
+/// become lock names, state filenames, integration destinations, or directory
+/// components and must therefore be portable and unambiguous.
+pub fn validate_managed_name(value: &str, field: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+        })
+        && !value.starts_with('.')
+        && !value.ends_with('.');
+
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidManifest(format!("invalid {field}: {value}")))
+    }
+}
+
+/// Validate an upstream version before it is embedded in a cellar path.
+pub fn validate_upstream_version(value: &str) -> Result<()> {
+    validate_managed_name(value, "upstream version")
+}
+
+/// Validate the complete local version component (`<upstream>-<release>`).
+pub fn validate_local_version(value: &str) -> Result<()> {
+    validate_managed_name(value, "local version")
+}
+
+/// Validate a repository release channel persisted in local package state.
+pub fn validate_channel(value: &str) -> Result<()> {
+    validate_managed_name(value, "release channel")
+}
+
 /// Ensure a relative symlink target cannot escape the package root.
 pub fn validate_symlink_target(link: &PackagePath, target: &str) -> Result<()> {
     if target.is_empty() || target.contains('\0') || Path::new(target).is_absolute() {
         return Err(Error::InvalidPackagePath(target.to_owned()));
     }
 
-    let mut depth = link
-        .parent()
-        .map_or(0, |parent| parent.components().count());
+    let mut depth = link.parent().map_or(0, |parent| parent.components().count());
 
     for component in Path::new(target).components() {
         match component {
@@ -110,4 +146,22 @@ pub fn validate_symlink_target(link: &PackagePath, target: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_channel, validate_local_version, validate_managed_name};
+
+    #[test]
+    fn managed_names_reject_path_traversal() {
+        for value in ["", ".", "..", "../beta", "beta/dev", ".hidden"] {
+            assert!(validate_managed_name(value, "test").is_err());
+        }
+    }
+
+    #[test]
+    fn versions_and_channels_accept_portable_values() {
+        assert!(validate_local_version("2026.1-1").is_ok());
+        assert!(validate_channel("early-access").is_ok());
+    }
 }

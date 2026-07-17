@@ -41,7 +41,9 @@ impl RepositoryConfig {
             anyhow::bail!("repository is not configured; create {}", path.display());
         }
 
-        Ok(serde_json::from_reader(File::open(path)?)?)
+        let config: Self = serde_json::from_reader(File::open(path)?)?;
+        pako_core::path::validate_managed_name(&config.name, "repository name")?;
+        Ok(config)
     }
 }
 

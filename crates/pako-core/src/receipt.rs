@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
-    canonical, error::IoContext, manifest::validate_package_name, Error, Result, Sha256Digest,
+    canonical, error::IoContext, manifest::validate_package_name,
+    path::{validate_channel, validate_local_version, validate_managed_name, validate_upstream_version},
+    Error, Result, Sha256Digest,
 };
 
 /// Immutable provenance for one installed version.
@@ -55,6 +57,8 @@ impl InstalledVersionRecord {
         }
 
         validate_package_name(&self.package)?;
+        validate_upstream_version(&self.upstream_version)?;
+        validate_managed_name(&self.repository, "repository name")?;
         if self.release == 0 {
             return Err(Error::InvalidManifest(
                 "receipt release must be positive".into(),
@@ -101,16 +105,31 @@ impl PackageState {
         if state.schema != 1 {
             return Err(Error::UnsupportedSchema(state.schema));
         }
-        validate_package_name(&state.package)?;
+        state.validate()?;
         Ok(state)
     }
 
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        save_atomic(self, path)
+    }
+
+    pub fn validate(&self) -> Result<()> {
         if self.schema != 1 {
             return Err(Error::UnsupportedSchema(self.schema));
         }
         validate_package_name(&self.package)?;
-        save_atomic(self, path)
+        validate_local_version(&self.active)?;
+        validate_channel(&self.channel)?;
+        if self.history.is_empty() || self.history.first() != Some(&self.active) {
+            return Err(Error::InvalidManifest(
+                "package state history must start with the active version".into(),
+            ));
+        }
+        for version in &self.history {
+            validate_local_version(version)?;
+        }
+        Ok(())
     }
 }
 

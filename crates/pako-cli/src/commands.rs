@@ -6,7 +6,7 @@ use pako_core::{
 
 use crate::{
     cli::{Cli, Command},
-    output::{confirm, Output},
+    output::confirm,
     repository::install_remote,
 };
 
@@ -14,7 +14,6 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
     let layout = Layout::discover()?;
     layout.ensure()?;
     let installer = Installer::new(layout.clone())?;
-    let output = Output::new(cli.json);
 
     match cli.command {
         Command::Install(arguments) => {
@@ -23,85 +22,66 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
                 &arguments.package,
                 &arguments.channel,
                 false,
-                true,
+                !cli.yes,
             )
             .await?;
         }
         Command::Upgrade(arguments) => {
+            let state = PackageState::load(&layout.package_state(&arguments.package)?)?;
+            let channel = arguments.channel.as_deref().unwrap_or(&state.channel);
             install_remote(
                 &installer,
                 &arguments.package,
-                "stable",
+                channel,
                 arguments.dry_run,
-                false,
+                !cli.yes && !arguments.dry_run,
             )
             .await?;
         }
         Command::Verify(arguments) => {
             let package = arguments.package;
             let report = installer.verify(&package)?;
-            let json = serde_json::json!({
-                "package": package,
-                "status": "healthy",
-                "files": report.files,
-                "directories": report.directories,
-                "symlinks": report.symlinks,
-                "treeDigest": report.tree_digest,
-            });
-            output.print(
-                &json,
-                format!("{package} is healthy ({} files)", report.files),
-            )?;
+            println!("{package} is healthy ({} files)", report.files);
         }
         Command::Rollback(arguments) => {
             let package = arguments.package;
             let version = installer.rollback(&package, arguments.to.as_deref())?;
-            let json = serde_json::json!({
-                "package": package,
-                "version": version,
-            });
-            output.print(&json, format!("rolled back {package} to {version}"))?;
+            println!("rolled back {package} to {version}");
         }
         Command::Versions(arguments) => {
             let state = installer.versions(&arguments.package)?;
-            output.print(&serde_json::to_value(&state)?, state.history.join("\n"))?;
+            for version in state.history {
+                println!("{version}");
+            }
         }
         Command::Prune(arguments) => {
             let removed = installer.prune(&arguments.package, arguments.keep)?;
-            output.print(
-                &serde_json::json!({"package": arguments.package, "removed": removed}),
-                "pruned retained versions",
-            )?;
+            println!("pruned {} retained version(s)", removed.len());
         }
         Command::Remove(arguments) => {
             let package = arguments.package;
             if !cli.yes && !confirm(&format!("Remove {package}?"))? {
+                println!("removal cancelled");
                 return Ok(());
             }
 
             installer.remove(&package)?;
-            let json = serde_json::json!({
-                "package": package,
-                "removed": true,
-            });
-            output.print(&json, format!("removed {package}"))?;
+            println!("removed {package}");
         }
-        Command::List => list_receipts(output, &layout)?,
+        Command::List => list_receipts(&layout)?,
         Command::Status(arguments) => {
-            status(output, &layout, arguments.package.as_deref())?;
+            status(&layout, arguments.package.as_deref())?;
         }
         Command::Recover => {
             let recovered = pako_core::transaction::recover(&layout)?;
-            let recovered_count = recovered.len();
-            let json = serde_json::json!({ "recovered": recovered });
-            output.print(&json, format!("recovered {recovered_count} transaction(s)"))?;
+            println!("recovered {} transaction(s)", recovered.len());
         }
     }
 
     Ok(())
 }
 
-fn list_receipts(output: Output, layout: &Layout) -> anyhow::Result<()> {
+fn list_receipts(layout: &Layout) -> anyhow::Result<()> {
     let mut receipts = Vec::new();
     let directory = layout.packages();
 
@@ -120,33 +100,34 @@ fn list_receipts(output: Output, layout: &Layout) -> anyhow::Result<()> {
 
     receipts.sort_by(|left, right| left.0.package.cmp(&right.0.package));
 
-    if output.is_json() {
-        println!("{}", serde_json::to_string_pretty(&receipts)?);
-    } else {
-        for (_, receipt) in receipts {
-            println!(
-                "{}\t{}-{}\t{}",
-                receipt.package, receipt.upstream_version, receipt.release, receipt.target,
-            );
-        }
+    for (state, receipt) in receipts {
+        println!(
+            "{}\t{}-{}\t{}\t{}",
+            receipt.package,
+            receipt.upstream_version,
+            receipt.release,
+            receipt.target,
+            state.channel,
+        );
     }
 
     Ok(())
 }
 
-fn status(output: Output, layout: &Layout, package: Option<&str>) -> anyhow::Result<()> {
+fn status(layout: &Layout, package: Option<&str>) -> anyhow::Result<()> {
     let Some(package) = package else {
-        return list_receipts(output, layout);
+        return list_receipts(layout);
     };
 
     let state = PackageState::load(&layout.package_state(package)?)?;
     let receipt = Receipt::load(&layout.version_record(package, &state.active)?)?;
-    let json = serde_json::json!({ "state": state, "version": receipt });
-    output.print(
-        &json,
-        format!(
-            "{} {}-{} ({})",
-            receipt.package, receipt.upstream_version, receipt.release, receipt.target
-        ),
-    )
+    println!(
+        "{} {}-{} ({}, channel {})",
+        receipt.package,
+        receipt.upstream_version,
+        receipt.release,
+        receipt.target,
+        state.channel,
+    );
+    Ok(())
 }

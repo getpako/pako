@@ -2,7 +2,11 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 
-use crate::{manifest::validate_package_name, Result};
+use crate::{
+    manifest::validate_package_name,
+    path::validate_local_version,
+    Result,
+};
 
 /// Filesystem locations used by Pako.
 ///
@@ -107,6 +111,7 @@ impl Layout {
 
     pub fn package_version(&self, package: &str, version: &str) -> Result<PathBuf> {
         validate_package_name(package)?;
+        validate_local_version(version)?;
         Ok(self.cellar().join(package).join(version))
     }
 
@@ -122,6 +127,7 @@ impl Layout {
 
     pub fn version_record(&self, package: &str, version: &str) -> Result<PathBuf> {
         validate_package_name(package)?;
+        validate_local_version(version)?;
         Ok(self
             .versions()
             .join(package)

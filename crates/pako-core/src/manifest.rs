@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    path::{validate_symlink_target, PackagePath},
+    path::{validate_managed_name, validate_symlink_target, validate_upstream_version, PackagePath},
     Error, Result, Sha256Digest,
 };
 
@@ -173,6 +173,7 @@ impl PackageManifest {
         }
 
         validate_package_name(&self.package)?;
+        validate_upstream_version(&self.upstream_version)?;
 
         if self.release == 0 {
             return Err(Error::InvalidManifest("release must be positive".into()));
@@ -292,7 +293,10 @@ impl PackageManifest {
         let entry_paths: BTreeSet<_> = self.entries.iter().map(Entry::path).collect();
 
         for launcher in &self.integrations.launchers {
-            validate_simple_name(&launcher.name, "launcher")?;
+            validate_managed_name(&launcher.name, "launcher name")?;
+            for argument in &launcher.arguments {
+                validate_single_line(argument, "launcher argument")?;
+            }
             if !entry_paths.contains(&launcher.target) {
                 return Err(Error::InvalidManifest(format!(
                     "launcher target missing: {}",
@@ -301,7 +305,20 @@ impl PackageManifest {
             }
         }
 
+        for desktop_entry in &self.integrations.desktop_entries {
+            validate_managed_name(&desktop_entry.id, "desktop entry id")?;
+            validate_single_line(&desktop_entry.name, "desktop entry name")?;
+            validate_single_line(&desktop_entry.exec, "desktop entry command")?;
+            validate_managed_name(&desktop_entry.icon, "desktop entry icon")?;
+            for category in &desktop_entry.categories {
+                validate_managed_name(category, "desktop entry category")?;
+            }
+        }
+
         for icon in &self.integrations.icons {
+            validate_managed_name(&icon.name, "icon name")?;
+            validate_managed_name(&icon.context, "icon context")?;
+            validate_managed_name(&icon.size, "icon size")?;
             if !entry_paths.contains(&icon.source) {
                 return Err(Error::InvalidManifest(format!(
                     "icon source missing: {}",
@@ -344,9 +361,9 @@ pub fn validate_package_name(name: &str) -> Result<()> {
     }
 }
 
-fn validate_simple_name(value: &str, field: &str) -> Result<()> {
-    if value.is_empty() || value.contains('/') || value.contains('\0') {
-        Err(Error::InvalidManifest(format!("invalid {field} name")))
+fn validate_single_line(value: &str, field: &str) -> Result<()> {
+    if value.chars().any(|character| matches!(character, '\0' | '\n' | '\r')) {
+        Err(Error::InvalidManifest(format!("invalid {field}")))
     } else {
         Ok(())
     }
