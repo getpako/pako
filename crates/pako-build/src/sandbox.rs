@@ -8,6 +8,7 @@ pub(crate) struct Sandbox {
     pub image: String,
     pub network: bool,
     pub timeout: Duration,
+    pub shell: String,
 }
 
 impl Sandbox {
@@ -53,7 +54,7 @@ impl Sandbox {
 
         command
             .arg(&self.image)
-            .args(["/bin/bash", "-euo", "pipefail", "-c", script])
+            .args([self.shell.as_str(), "-euo", "pipefail", "-c", script])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 

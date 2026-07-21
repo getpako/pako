@@ -78,7 +78,7 @@ pub(crate) async fn resolve_remote(
     package: &str,
     channel: &str,
     operation: PackageOperation,
-    _concurrency: Concurrency,
+    concurrency: Concurrency,
     ui: Ui,
 ) -> anyhow::Result<RemoteInstallPlan> {
     let repository = RepositoryConfig::load(installer.layout())?;
@@ -89,10 +89,10 @@ pub(crate) async fn resolve_remote(
         installer.layout().state.join("tuf").join(&repository.name),
     );
     let catalog = trusted.refresh_catalog().await?;
-    let target = host_target()?;
+    let target = host_target();
     let release = catalog.resolve(package, &target, channel)?;
     let reference = OciReference::from_str(&release.oci)?.with_digest(release.manifest_digest);
-    let mut client = OciClient::new()?;
+    let mut client = OciClient::new()?.with_download_limit(concurrency.download_jobs);
     if repository.allow_insecure_http {
         ensure_loopback_registry(&reference.registry)?;
         client = client.insecure_http();
@@ -241,11 +241,8 @@ async fn fetch_image_manifest(
     let (_, bytes) = client.fetch_manifest(reference).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
-fn host_target() -> anyhow::Result<String> {
-    Ok(format!(
-        "linux/{}",
-        normalize_architecture(std::env::consts::ARCH)
-    ))
+fn host_target() -> String {
+    format!("linux/{}", normalize_architecture(std::env::consts::ARCH))
 }
 fn normalize_architecture(value: &str) -> &str {
     match value {

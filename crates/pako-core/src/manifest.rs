@@ -188,13 +188,13 @@ impl PackageManifest {
             }
 
             validate_entry_mode(entry)?;
-            self.validate_entry_content(entry)?;
+            Self::validate_entry_content(entry)?;
         }
 
         self.validate_parent_directories(&paths)
     }
 
-    fn validate_entry_content(&self, entry: &Entry) -> Result<()> {
+    fn validate_entry_content(entry: &Entry) -> Result<()> {
         match entry {
             Entry::File { size, digest, .. } => {
                 if *size == 0 && *digest != Sha256Digest::EMPTY {

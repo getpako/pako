@@ -289,7 +289,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 || std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
                 NonZeroUsize::get,
             );
-            let report = builder::Builder::new(arguments.output, jobs)?
+            let report = builder::Builder::new(arguments.output, jobs)
                 .build(&recipe, &arguments.target)
                 .await?;
 

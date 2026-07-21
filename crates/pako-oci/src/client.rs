@@ -13,6 +13,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use url::Url;
 
@@ -87,6 +88,7 @@ pub trait Registry: Send + Sync {
 pub struct OciClient {
     client: Client,
     credentials: Option<Arc<Credentials>>,
+    download_limit: Arc<Semaphore>,
     scheme: String,
 }
 
@@ -115,8 +117,16 @@ impl OciClient {
         Ok(Self {
             client,
             credentials: None,
+            download_limit: Arc::new(Semaphore::new(6)),
             scheme: "https".into(),
         })
+    }
+
+    /// Limit the number of blob downloads sharing this client.
+    #[must_use]
+    pub fn with_download_limit(mut self, limit: usize) -> Self {
+        self.download_limit = Arc::new(Semaphore::new(limit.max(1)));
+        self
     }
 
     #[must_use]
@@ -262,6 +272,7 @@ impl Registry for OciClient {
         destination: &Path,
         shared_progress: Option<&ProgressBar>,
     ) -> anyhow::Result<()> {
+        let _permit: OwnedSemaphorePermit = self.download_limit.clone().acquire_owned().await?;
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

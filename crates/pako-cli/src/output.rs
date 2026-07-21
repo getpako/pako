@@ -87,26 +87,6 @@ impl Ui {
         progress.enable_steady_tick(Duration::from_millis(100));
         progress
     }
-
-    pub(crate) fn item_progress(
-        self,
-        message: impl Into<String>,
-        total: usize,
-        unit: &str,
-    ) -> ProgressBar {
-        let progress = pako_log::add_progress(ProgressBar::new(total as u64));
-        progress.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} {prefix} ({per_sec})",
-            )
-            .expect("item progress template is valid")
-            .progress_chars("#>-"),
-        );
-        progress.set_message(message.into());
-        progress.set_prefix(unit.to_owned());
-        progress.enable_steady_tick(Duration::from_millis(100));
-        progress
-    }
 }
 
 #[derive(Debug)]

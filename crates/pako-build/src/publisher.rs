@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use log::info;
 use pako_core::{
@@ -60,11 +63,11 @@ pub(crate) async fn publish(
             media_type: OCI_EMPTY_CONFIG_MEDIA_TYPE.into(),
             digest: config_digest,
             size: 2,
-            annotations: Default::default(),
+            annotations: BTreeMap::default(),
             platform: None,
         },
         layers,
-        annotations: Default::default(),
+        annotations: BTreeMap::default(),
     };
     let bytes = canonical::to_vec(&image)?;
     let digest = Sha256Digest::calculate(&bytes);
@@ -87,7 +90,7 @@ pub(crate) async fn publish(
             media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.into(),
             digest,
             size: u64::try_from(bytes.len())?,
-            annotations: Default::default(),
+            annotations: BTreeMap::default(),
             platform: Some(Platform {
                 os: os.into(),
                 architecture: match architecture {
@@ -98,7 +101,7 @@ pub(crate) async fn publish(
                 .into(),
             }),
         }],
-        annotations: Default::default(),
+        annotations: BTreeMap::default(),
     };
     client
         .push_manifest(
@@ -140,7 +143,7 @@ fn descriptor(media_type: &str, digest: Sha256Digest, path: &Path) -> anyhow::Re
         media_type: media_type.into(),
         digest,
         size: std::fs::metadata(path)?.len(),
-        annotations: Default::default(),
+        annotations: BTreeMap::default(),
         platform: None,
     })
 }
