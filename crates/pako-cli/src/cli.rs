@@ -6,8 +6,8 @@ const ROOT_LONG_ABOUT: &str = "\
 Pako is a user-space package manager for Linux.
 
 Packages are installed into user-owned XDG directories. Pako resolves releases
-from a configured, trusted repository, downloads only the content which is not
-already available locally, verifies the complete package tree, and atomically
+from a configured, trusted repository, downloads one verified payload archive,
+verifies the complete package tree, and atomically
 activates the new version.
 
 Normal package operations do not require root privileges. Installed versions
@@ -30,11 +30,10 @@ const INSTALL_LONG_ABOUT: &str = "\
 Install a package from the configured Pako repository.
 
 Pako resolves the requested package, release channel, and host architecture
-using signed repository metadata. It then downloads the package manifest, pack
-index, and only those immutable packs which contain chunks missing from the
-local object store.
+using signed repository metadata. It then downloads the package manifest and
+its single `payload.tar.zst` archive.
 
-The package is materialized into a staging directory and the complete tree is
+The payload is extracted into a staging directory and the complete tree is
 verified before activation. Activation is atomic: an incomplete or invalid
 package never replaces the currently active version.
 
@@ -52,13 +51,12 @@ Examples:
 const UPGRADE_LONG_ABOUT: &str = "\
 Upgrade a package using its locally remembered release channel.
 
-The command uses the same transactional pipeline as installation. Existing
-chunks are reused from the local object store, only missing pack data is
-downloaded, and the new tree is fully verified before it becomes active.
+The command uses the same transactional pipeline as installation. The payload
+is downloaded and the new tree is fully verified before it becomes active.
 
 The previously active version remains available as a rollback candidate. Use
 `--dry-run` to resolve metadata and print the download plan without downloading
-package packs or modifying the installation.";
+the payload or modifying the installation.";
 
 const UPGRADE_AFTER_HELP: &str = "\
 Examples:
@@ -115,9 +113,8 @@ Remove an installed package and all of its retained versions.
 Pako removes the package-owned launchers, desktop entries, icons, active-version
 symlink, versioned cellar directories, stored package manifests, and receipt.
 
-Shared objects and downloaded pack files are not removed by this command because
-they may still be useful to other packages or future installations. Removal is
-interactive unless the global `--yes` option is supplied.";
+The temporary download is removed after installation. Removal is interactive
+unless the global `--yes` option is supplied.";
 
 const REMOVE_AFTER_HELP: &str = "\
 Examples:
@@ -315,7 +312,7 @@ pub(crate) struct UpgradeArgs {
     #[arg(long, value_name = "CHANNEL")]
     pub(crate) channel: Option<String>,
 
-    /// Print the resolved download plan without downloading packs or changing
+    /// Print the resolved download plan without downloading the payload or changing
     /// the active installation.
     #[arg(long)]
     pub(crate) dry_run: bool,

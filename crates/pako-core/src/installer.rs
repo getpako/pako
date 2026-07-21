@@ -9,9 +9,8 @@ use crate::{
     error::IoContext,
     integrations,
     layout::Layout,
-    manifest::{PackIndex, PackageManifest},
-    materialize,
-    object_store::ObjectStore,
+    manifest::PackageManifest,
+    payload,
     receipt::{PackageState, Receipt},
     transaction::{activate_symlink, CommitPlan, Journal, PackageLock, Phase, RecoveryAction},
     verify, Error, Result, Sha256Digest,
@@ -22,7 +21,7 @@ pub struct InstallRequest {
     pub repository: String,
     pub oci_manifest_digest: Sha256Digest,
     pub package_manifest_digest: Sha256Digest,
-    pub pack_index_digest: Sha256Digest,
+    pub payload_digest: Sha256Digest,
     pub channel: String,
 }
 
@@ -30,7 +29,6 @@ pub struct InstallRequest {
 #[derive(Debug, Clone)]
 pub struct Installer {
     layout: Layout,
-    store: ObjectStore,
     jobs: usize,
 }
 
@@ -42,10 +40,8 @@ impl Installer {
 
     pub fn with_jobs(layout: Layout, jobs: usize) -> Result<Self> {
         layout.ensure()?;
-        let store = ObjectStore::new(layout.objects(), layout.locks().join("objects"));
         Ok(Self {
             layout,
-            store,
             jobs: jobs.max(1),
         })
     }
@@ -54,23 +50,27 @@ impl Installer {
         &self.layout
     }
 
-    pub fn store(&self) -> &ObjectStore {
-        &self.store
-    }
-
-    /// Install one fully resolved package release.
-    ///
-    /// The caller is responsible for downloading and importing all required
-    /// chunks. This method performs only local transactional work.
+    /// Install one fully resolved package release from a verified payload archive.
     #[allow(clippy::too_many_lines)]
     pub fn install(
         &self,
         manifest: &PackageManifest,
-        index: &PackIndex,
+        payload_path: &Path,
         request: &InstallRequest,
     ) -> Result<Receipt> {
         manifest.validate()?;
-        index.validate_against(manifest)?;
+        let (payload_digest, payload_size) =
+            Sha256Digest::calculate_reader(File::open(payload_path).at(payload_path)?)?;
+        if payload_digest != manifest.payload.digest || payload_size != manifest.payload.size {
+            return Err(Error::Integrity {
+                path: payload_path.to_owned(),
+                expected: format!(
+                    "{} ({} bytes)",
+                    manifest.payload.digest, manifest.payload.size
+                ),
+                actual: format!("{payload_digest} ({payload_size} bytes)"),
+            });
+        }
         log::info!(
             "installing {} {}-{} for {}",
             manifest.package,
@@ -101,8 +101,8 @@ impl Installer {
         );
         journal.save(&self.layout)?;
 
-        log::debug!("materializing package tree at {}", staging.display());
-        materialize::materialize_with_jobs(manifest, &self.store, &staging, self.jobs)?;
+        log::debug!("extracting payload at {}", staging.display());
+        payload::extract(payload_path, &staging)?;
         journal.advance(&self.layout, Phase::Materialized)?;
 
         log::debug!("verifying staged package tree");
@@ -112,7 +112,7 @@ impl Installer {
         // All possible integration conflicts are discovered before the new
         // version becomes visible. Their content is staged under private
         // names, allowing recovery to finish publication idempotently.
-        self.save_release_metadata(manifest, index, &version)?;
+        self.save_release_metadata(manifest, &version)?;
         let receipt = Receipt {
             schema: 1,
             package: manifest.package.clone(),
@@ -122,7 +122,7 @@ impl Installer {
             repository: request.repository.clone(),
             oci_manifest_digest: request.oci_manifest_digest,
             package_manifest_digest: request.package_manifest_digest,
-            pack_index_digest: request.pack_index_digest,
+            payload_digest: request.payload_digest,
             tree_digest: manifest.tree_digest,
             installed_at: now_seconds().to_string(),
             exposures: Vec::new(),
@@ -336,12 +336,7 @@ impl Installer {
         }
     }
 
-    fn save_release_metadata(
-        &self,
-        manifest: &PackageManifest,
-        index: &PackIndex,
-        version: &str,
-    ) -> Result<()> {
+    fn save_release_metadata(&self, manifest: &PackageManifest, version: &str) -> Result<()> {
         let directory = self
             .layout
             .manifests()
@@ -352,8 +347,6 @@ impl Installer {
         let manifest_path = directory.join("package-manifest.json");
         std::fs::write(&manifest_path, canonical::to_vec(manifest)?).at(&manifest_path)?;
 
-        let index_path = directory.join("pack-index.json");
-        std::fs::write(&index_path, canonical::to_vec(index)?).at(&index_path)?;
         Ok(())
     }
 

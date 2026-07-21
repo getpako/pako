@@ -81,14 +81,6 @@ impl Layout {
         self.data.join("staging")
     }
 
-    pub fn objects(&self) -> PathBuf {
-        self.cache.join("objects")
-    }
-
-    pub fn packs(&self) -> PathBuf {
-        self.cache.join("packs")
-    }
-
     pub fn packages(&self) -> PathBuf {
         self.state.join("packages")
     }

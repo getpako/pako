@@ -411,7 +411,7 @@ mod tests {
             repository: "test".into(),
             oci_manifest_digest: digest,
             package_manifest_digest: digest,
-            pack_index_digest: digest,
+            payload_digest: digest,
             tree_digest: digest,
             installed_at: "0".into(),
             exposures: vec![ExposureReceipt {

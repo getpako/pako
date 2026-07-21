@@ -25,7 +25,7 @@ pub struct InstalledVersionRecord {
     pub repository: String,
     pub oci_manifest_digest: Sha256Digest,
     pub package_manifest_digest: Sha256Digest,
-    pub pack_index_digest: Sha256Digest,
+    pub payload_digest: Sha256Digest,
     pub tree_digest: Sha256Digest,
     pub installed_at: String,
     pub exposures: Vec<ExposureReceipt>,

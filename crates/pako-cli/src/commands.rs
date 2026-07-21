@@ -261,32 +261,9 @@ fn print_remote_plan(plan: &RemoteInstallPlan, layout: &Layout, ui: Ui) -> anyho
     }
     ui.field("Version", plan.version());
     ui.field("Target", &plan.target);
-    ui.field(
-        "Download",
-        format!(
-            "{} in {} pack(s)",
-            format_size(plan.download.network_bytes),
-            plan.download.packs_to_download()
-        ),
-    );
-    if plan.download.cached_packs() > 0 {
-        ui.field(
-            "Pack cache",
-            format!("{} verified pack(s)", plan.download.cached_packs()),
-        );
-    }
-    ui.field(
-        "Local reuse",
-        format!(
-            "{} ({} of {} chunks)",
-            format_size(plan.reusable_bytes),
-            plan.available_chunks,
-            plan.total_chunks
-        ),
-    );
+    ui.field("Download", format_size(plan.download_bytes));
     ui.field("Installed", format_size(plan.installed_bytes));
     ui.field("Data growth", format_size(plan.data_growth()));
-    ui.field("Cache growth", format_size(plan.cache_growth()));
     ui.field(
         "Free space",
         format!(
@@ -304,12 +281,6 @@ fn print_remote_plan(plan: &RemoteInstallPlan, layout: &Layout, ui: Ui) -> anyho
     );
     if plan.current_version.is_some() {
         ui.field("Rollback", "previous version will be retained");
-    }
-    if plan.download.overfetch_bytes() > 0 {
-        ui.field(
-            "Pack overfetch",
-            format_size(plan.download.overfetch_bytes()),
-        );
     }
     Ok(())
 }

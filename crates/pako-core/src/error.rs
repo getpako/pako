@@ -12,16 +12,12 @@ pub enum Error {
     UnsupportedSchema(u32),
     #[error("manifest validation failed: {0}")]
     InvalidManifest(String),
-    #[error("packfile is invalid: {0}")]
-    InvalidPack(String),
     #[error("integrity verification failed for {path}: expected {expected}, got {actual}")]
     Integrity {
         path: PathBuf,
         expected: String,
         actual: String,
     },
-    #[error("required chunk is unavailable: {0}")]
-    MissingChunk(String),
     #[error("path already belongs to another package: {0}")]
     ExposureConflict(PathBuf),
     #[error("transaction is incomplete and cannot be recovered automatically: {0}")]

@@ -1,19 +1,9 @@
-use std::{
-    collections::{BTreeMap, VecDeque},
-    fs::File,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-};
+use std::path::{Path, PathBuf};
 
-use futures_util::{stream, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use pako_core::{
     canonical,
-    manifest::{PackIndex, PackageManifest, PACKAGE_MANIFEST_MEDIA_TYPE, PACK_INDEX_MEDIA_TYPE},
+    manifest::{PackageManifest, PACKAGE_MANIFEST_MEDIA_TYPE, PAYLOAD_MEDIA_TYPE},
     Sha256Digest,
 };
 use pako_oci::{
@@ -24,12 +14,7 @@ use tempfile::NamedTempFile;
 const OCI_IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
-const PACK_MEDIA_TYPE: &str = "application/vnd.pako.chunk-pack.v1";
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "publication order is kept together to make its atomicity guarantees auditable"
-)]
 pub(crate) async fn publish(
     artifact: &Path,
     reference: OciReference,
@@ -39,10 +24,7 @@ pub(crate) async fn publish(
     if matches!(reference.reference, Reference::Digest(_)) {
         anyhow::bail!("publish reference must use a tag, not a digest");
     }
-
-    info!("loading and verifying publish artifact");
-    let artifact = artifact.to_owned();
-    let artifacts = tokio::task::spawn_blocking(move || Artifacts::load(&artifact)).await??;
+    let artifacts = Artifacts::load(artifact)?;
     let mut client = OciClient::new()?;
     if insecure_http {
         client = client.insecure_http();
@@ -50,142 +32,49 @@ pub(crate) async fn publish(
     if let Some((username, password)) = credentials {
         client = client.with_basic_auth(username, password);
     }
-
     let config = NamedTempFile::new()?;
     std::fs::write(config.path(), b"{}")?;
-    info!("uploading OCI configuration");
     let config_digest = client.push_blob(&reference, config.path()).await?;
-
-    info!("uploading package manifest");
-    let package_digest = push_checked_blob(
-        &client,
-        &reference,
-        &artifacts.package_manifest,
-        artifacts.package_manifest_digest,
-    )
-    .await?;
-    info!("uploading pack index");
-    let index_digest = push_checked_blob(
-        &client,
-        &reference,
-        &artifacts.pack_index,
-        artifacts.pack_index_digest,
-    )
-    .await?;
-    if package_digest != artifacts.package_manifest_digest
-        || index_digest != artifacts.pack_index_digest
+    info!("uploading package manifest and payload");
+    let manifest_digest = client
+        .push_blob(&reference, &artifacts.manifest_path)
+        .await?;
+    let payload_digest = client.push_blob(&reference, &artifacts.payload).await?;
+    if manifest_digest != artifacts.manifest_digest
+        || payload_digest != artifacts.manifest.payload.digest
     {
-        anyhow::bail!("artifact metadata changed while publishing");
+        anyhow::bail!("artifact changed while publishing");
     }
-
-    let mut layers = vec![
+    let layers = vec![
         descriptor(
             PACKAGE_MANIFEST_MEDIA_TYPE,
-            package_digest,
-            &artifacts.package_manifest,
+            manifest_digest,
+            &artifacts.manifest_path,
         )?,
-        descriptor(PACK_INDEX_MEDIA_TYPE, index_digest, &artifacts.pack_index)?,
+        descriptor(PAYLOAD_MEDIA_TYPE, payload_digest, &artifacts.payload)?,
     ];
-    let pack_count = artifacts.packs.len();
-    let upload_bytes =
-        artifacts
-            .packs
-            .values()
-            .try_fold(0_u64, |total, path| -> anyhow::Result<u64> {
-                total
-                    .checked_add(std::fs::metadata(path)?.len())
-                    .ok_or_else(|| anyhow::anyhow!("pack upload size overflow"))
-            })?;
-    let progress = pack_upload_progress(pack_count, upload_bytes);
-    let completed_packs = Arc::new(AtomicUsize::new(0));
-    let upload_jobs = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(6);
-    let upload_client = client.clone();
-    let upload_reference = reference.clone();
-    let upload_progress = progress.clone();
-    let upload_completed = Arc::clone(&completed_packs);
-    let uploads = stream::iter(artifacts.packs.iter().map(move |(digest, path)| {
-        let digest = *digest;
-        let path = path.clone();
-        let progress = upload_progress.clone();
-        let completed = Arc::clone(&upload_completed);
-        let client = upload_client.clone();
-        let reference = upload_reference.clone();
-        async move {
-            let uploaded =
-                push_checked_blob_with_progress(&client, &reference, &path, digest, &progress)
-                    .await?;
-            if uploaded != digest {
-                anyhow::bail!(
-                    "pack filename digest does not match its contents: {}",
-                    path.display()
-                );
-            }
-            let layer = descriptor(PACK_MEDIA_TYPE, uploaded, &path)?;
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            progress.set_prefix(format!("{done}/{pack_count} packs"));
-            log::debug!("uploaded pack {digest} ({done}/{pack_count})");
-            Ok::<_, anyhow::Error>((digest, layer))
-        }
-    }))
-    .buffer_unordered(upload_jobs.max(1));
-
-    futures_util::pin_mut!(uploads);
-    let mut pack_layers = BTreeMap::new();
-    let upload_result = async {
-        while let Some(result) = uploads.next().await {
-            let (digest, layer) = result?;
-            pack_layers.insert(digest, layer);
-        }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    if let Err(error) = upload_result {
-        pako_log::abandon_progress(&progress, "Pack upload failed");
-        return Err(error);
-    }
-    layers.extend(pack_layers.into_values());
-    pako_log::finish_progress(&progress, format!("Uploaded {pack_count} packs"));
-
-    let manifest = ImageManifest {
+    let image = ImageManifest {
         schema_version: 2,
         media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.into(),
         config: Descriptor {
             media_type: OCI_EMPTY_CONFIG_MEDIA_TYPE.into(),
             digest: config_digest,
             size: 2,
-            annotations: BTreeMap::default(),
+            annotations: Default::default(),
             platform: None,
         },
         layers,
-        annotations: BTreeMap::from([
-            (
-                "org.opencontainers.image.title".into(),
-                artifacts.manifest.package.clone(),
-            ),
-            (
-                "org.opencontainers.image.version".into(),
-                artifacts.manifest.upstream_version.clone(),
-            ),
-            (
-                "dev.pako.release".into(),
-                artifacts.manifest.release.to_string(),
-            ),
-            ("dev.pako.target".into(), artifacts.manifest.target.clone()),
-        ]),
+        annotations: Default::default(),
     };
-    let manifest_bytes = canonical::to_vec(&manifest)?;
-    let manifest_digest = Sha256Digest::calculate(&manifest_bytes);
-    info!("publishing platform manifest");
+    let bytes = canonical::to_vec(&image)?;
+    let digest = Sha256Digest::calculate(&bytes);
     client
         .push_manifest(
-            &reference.with_digest(manifest_digest),
+            &reference.with_digest(digest),
             OCI_IMAGE_MANIFEST_MEDIA_TYPE,
-            &manifest_bytes,
+            &bytes,
         )
         .await?;
-
     let (os, architecture) = artifacts
         .manifest
         .target
@@ -196,211 +85,62 @@ pub(crate) async fn publish(
         media_type: OCI_IMAGE_INDEX_MEDIA_TYPE.into(),
         manifests: vec![Descriptor {
             media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.into(),
-            digest: manifest_digest,
-            size: u64::try_from(manifest_bytes.len())?,
-            annotations: BTreeMap::default(),
+            digest,
+            size: u64::try_from(bytes.len())?,
+            annotations: Default::default(),
             platform: Some(Platform {
-                architecture: oci_architecture(architecture)?.into(),
                 os: os.into(),
+                architecture: match architecture {
+                    "x86_64" => "amd64",
+                    "aarch64" => "arm64",
+                    _ => anyhow::bail!("unsupported target"),
+                }
+                .into(),
             }),
         }],
-        annotations: BTreeMap::from([
-            (
-                "org.opencontainers.image.title".into(),
-                artifacts.manifest.package,
-            ),
-            (
-                "org.opencontainers.image.version".into(),
-                artifacts.manifest.upstream_version,
-            ),
-        ]),
+        annotations: Default::default(),
     };
-    let index_bytes = canonical::to_vec(&index)?;
-    info!("publishing OCI image index");
     client
-        .push_manifest(&reference, OCI_IMAGE_INDEX_MEDIA_TYPE, &index_bytes)
+        .push_manifest(
+            &reference,
+            OCI_IMAGE_INDEX_MEDIA_TYPE,
+            &canonical::to_vec(&index)?,
+        )
         .await
-}
-
-fn oci_architecture(architecture: &str) -> anyhow::Result<&'static str> {
-    match architecture {
-        "x86_64" => Ok("amd64"),
-        "aarch64" => Ok("arm64"),
-        _ => anyhow::bail!("unsupported Pako architecture for OCI: {architecture}"),
-    }
 }
 
 #[derive(Debug)]
 struct Artifacts {
     manifest: PackageManifest,
-    package_manifest: PathBuf,
-    package_manifest_digest: Sha256Digest,
-    pack_index: PathBuf,
-    pack_index_digest: Sha256Digest,
-    packs: BTreeMap<Sha256Digest, PathBuf>,
+    manifest_path: PathBuf,
+    manifest_digest: Sha256Digest,
+    payload: PathBuf,
 }
-
 impl Artifacts {
     fn load(directory: &Path) -> anyhow::Result<Self> {
-        let package_manifest = directory.join("package-manifest.json");
-        let package_bytes = std::fs::read(&package_manifest)?;
-        let manifest: PackageManifest = serde_json::from_slice(&package_bytes)?;
+        let manifest_path = directory.join("package-manifest.json");
+        let bytes = std::fs::read(&manifest_path)?;
+        let manifest: PackageManifest = serde_json::from_slice(&bytes)?;
         manifest.validate()?;
-        let package_manifest_digest = Sha256Digest::calculate(&package_bytes);
-        let pack_index = directory.join("pack-index.json");
-        let index_bytes = std::fs::read(&pack_index)?;
-        let index: PackIndex = serde_json::from_slice(&index_bytes)?;
-        index.validate_against(&manifest)?;
-        if index.package_manifest_digest != package_manifest_digest {
-            anyhow::bail!("pack index references a different package manifest");
+        let payload = directory.join("payload.tar.zst");
+        let (digest, size) = Sha256Digest::calculate_reader(std::fs::File::open(&payload)?)?;
+        if digest != manifest.payload.digest || size != manifest.payload.size {
+            anyhow::bail!("payload does not match manifest");
         }
-        let pack_count = index.packs.len();
-        let progress = pack_progress("verifying packs", pack_count);
-        let jobs = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(pack_count.max(1));
-        let pending = index
-            .packs
-            .iter()
-            .map(|(digest, descriptor)| (*digest, descriptor.size))
-            .collect::<Vec<_>>();
-        let queue = Mutex::new(VecDeque::from(pending));
-        let results = Mutex::new(Vec::new());
-
-        std::thread::scope(|scope| {
-            for _ in 0..jobs {
-                let queue = &queue;
-                let results = &results;
-                let progress = progress.clone();
-                scope.spawn(move || loop {
-                    let Some((digest, size)) = queue
-                        .lock()
-                        .expect("pack verification queue lock poisoned")
-                        .pop_front()
-                    else {
-                        return;
-                    };
-                    let path = directory
-                        .join("packs")
-                        .join(format!("{}.pakopack", digest.hex()));
-                    let result = verify_pack_artifact(&path, digest, size).map(|()| (digest, path));
-                    progress.inc(1);
-                    results
-                        .lock()
-                        .expect("pack verification result lock poisoned")
-                        .push(result);
-                });
-            }
-        });
-
-        let verified = results
-            .into_inner()
-            .expect("pack verification result lock poisoned")
-            .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>();
-        let verified = match verified {
-            Ok(verified) => verified,
-            Err(error) => {
-                pako_log::abandon_progress(&progress, "Pack verification failed");
-                return Err(error);
-            }
-        };
-        let packs = verified.into_iter().collect::<BTreeMap<_, _>>();
-        pako_log::finish_progress(&progress, format!("Verified {pack_count} packs"));
         Ok(Self {
             manifest,
-            package_manifest,
-            package_manifest_digest,
-            pack_index,
-            pack_index_digest: Sha256Digest::calculate(&index_bytes),
-            packs,
+            manifest_path,
+            manifest_digest: Sha256Digest::calculate(&bytes),
+            payload,
         })
     }
 }
-
-fn verify_pack_artifact(
-    path: &Path,
-    expected_digest: Sha256Digest,
-    expected_size: u64,
-) -> anyhow::Result<()> {
-    if std::fs::metadata(path)?.len() != expected_size {
-        anyhow::bail!("pack size does not match index: {}", path.display());
-    }
-    let (actual, _) = Sha256Digest::calculate_reader(File::open(path)?)?;
-    if actual != expected_digest {
-        anyhow::bail!("pack digest does not match index: {}", path.display());
-    }
-    Ok(())
-}
-
-fn pack_upload_progress(pack_count: usize, total_bytes: u64) -> ProgressBar {
-    let progress = pako_log::add_progress(ProgressBar::new(total_bytes));
-    let style = ProgressStyle::with_template(
-        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta}) {prefix}",
-    )
-    .expect("pack upload progress template is valid")
-    .progress_chars("#>-");
-    progress.set_style(style);
-    progress.set_message("Uploading packs");
-    progress.set_prefix(format!("0/{pack_count} packs"));
-    progress.enable_steady_tick(std::time::Duration::from_millis(100));
-    progress
-}
-
-fn pack_progress(message: &str, pack_count: usize) -> ProgressBar {
-    let progress = pako_log::add_progress(ProgressBar::new(pack_count as u64));
-    let style = ProgressStyle::with_template(
-        "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} packs ({per_sec})",
-    )
-    .expect("pack publish progress template is valid")
-    .progress_chars("#>-");
-    progress.set_style(style);
-    progress.set_message(message.to_owned());
-    progress.enable_steady_tick(std::time::Duration::from_millis(100));
-    progress
-}
-
-async fn push_checked_blob(
-    client: &OciClient,
-    reference: &OciReference,
-    path: &Path,
-    expected: Sha256Digest,
-) -> anyhow::Result<Sha256Digest> {
-    let actual = client.push_blob(reference, path).await?;
-    if actual != expected {
-        anyhow::bail!(
-            "registry returned an unexpected blob digest for {}",
-            path.display()
-        );
-    }
-    Ok(actual)
-}
-
-async fn push_checked_blob_with_progress(
-    client: &OciClient,
-    reference: &OciReference,
-    path: &Path,
-    expected: Sha256Digest,
-    progress: &ProgressBar,
-) -> anyhow::Result<Sha256Digest> {
-    let actual = client
-        .push_blob_with_progress(reference, path, progress)
-        .await?;
-    if actual != expected {
-        anyhow::bail!(
-            "registry returned an unexpected blob digest for {}",
-            path.display()
-        );
-    }
-    Ok(actual)
-}
-
 fn descriptor(media_type: &str, digest: Sha256Digest, path: &Path) -> anyhow::Result<Descriptor> {
     Ok(Descriptor {
         media_type: media_type.into(),
         digest,
         size: std::fs::metadata(path)?.len(),
-        annotations: BTreeMap::default(),
+        annotations: Default::default(),
         platform: None,
     })
 }

@@ -14,8 +14,7 @@ Build Pako package artifacts from a versioned recipe.
 
 `pako-build` is a maintainer tool. It validates recipe files, fetches and
 verifies pinned sources, prepares a package payload for one target, audits the
-result, divides regular files into content-defined chunks, and writes immutable
-packfiles plus the generated package manifest and pack index.
+result and writes a `payload.tar.zst` archive plus the generated package manifest.
 
 Build scripts from source recipes run only in the configured build sandbox.
 They are never included in, or executed by, the end-user Pako client.";
@@ -61,8 +60,8 @@ prepare, configure, build, check, and install stages inside the configured
 sandbox. The install stage must place the final payload in `PAKO_DESTDIR`.
 
 After payload validation, the builder creates deterministic package metadata,
-content-defined chunks, immutable packfiles, and a pack index in the selected
-output directory. This command does not publish artifacts to a registry.";
+one `payload.tar.zst` archive and a package manifest in the selected output
+directory. This command does not publish artifacts to a registry.";
 
 const BUILD_AFTER_HELP: &str = "\
 Examples:
@@ -77,9 +76,7 @@ Examples:
 
 Generated files include:
   package-manifest.json
-  pack-index.json
-  build-report.json
-  packs/*.pakopack";
+  payload.tar.zst";
 
 /// Command-line interface for package maintainers.
 #[derive(Debug, Parser)]
@@ -108,7 +105,7 @@ enum Command {
     #[command(long_about = LINT_LONG_ABOUT, after_help = LINT_AFTER_HELP)]
     Lint(LintArgs),
 
-    /// Build one target into manifests and immutable packfiles.
+    /// Build one target into a manifest and payload archive.
     #[command(long_about = BUILD_LONG_ABOUT, after_help = BUILD_AFTER_HELP)]
     Build(BuildArgs),
 
@@ -142,12 +139,12 @@ struct BuildArgs {
     #[arg(long, value_name = "TARGET")]
     target: String,
 
-    /// Directory in which generated manifests, reports, and packfiles are
+    /// Directory in which generated manifests and payload archive are
     /// written.
     #[arg(long, value_name = "DIRECTORY", default_value = "build")]
     output: PathBuf,
 
-    /// Maximum number of packs to compress concurrently. Defaults to all
+    /// Maximum number of worker jobs. Defaults to all
     /// available CPUs.
     #[arg(long, value_name = "JOBS")]
     jobs: Option<NonZeroUsize>,
@@ -156,8 +153,8 @@ struct BuildArgs {
 const PUBLISH_LONG_ABOUT: &str = "\
 Upload a verified pako-build artifact directory to an OCI registry.
 
-The command verifies the package manifest, pack index, and every immutable pack
-before uploading. It publishes an OCI platform manifest by digest and then an
+The command verifies the package manifest and payload archive before uploading.
+It publishes an OCI platform manifest by digest and then an
 OCI image index at the requested tag. It then updates and signs `catalog.json`
 in the supplied local TUF repository.";
 
@@ -303,7 +300,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 );
                 println!("output: {}", report.output.display());
                 println!("manifest: {}", report.package_manifest.display());
-                println!("pack index: {}", report.pack_index.display());
+                println!("payload: {}", report.payload.display());
             });
         }
         Command::Publish(arguments) => {
