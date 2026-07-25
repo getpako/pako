@@ -6,7 +6,7 @@ use std::{
 use log::info;
 use pako_core::{
     canonical,
-    manifest::{PackageManifest, PACKAGE_MANIFEST_MEDIA_TYPE, PAYLOAD_MEDIA_TYPE},
+    manifest::{PackageManifest, ARCHIVE_MEDIA_TYPE, PACKAGE_MANIFEST_MEDIA_TYPE},
     Sha256Digest,
 };
 use pako_oci::{
@@ -44,7 +44,7 @@ pub(crate) async fn publish(
         .await?;
     let payload_digest = client.push_blob(&reference, &artifacts.payload).await?;
     if manifest_digest != artifacts.manifest_digest
-        || payload_digest != artifacts.manifest.payload.digest
+        || payload_digest != artifacts.manifest.artifact.digest()
     {
         anyhow::bail!("artifact changed while publishing");
     }
@@ -54,7 +54,7 @@ pub(crate) async fn publish(
             manifest_digest,
             &artifacts.manifest_path,
         )?,
-        descriptor(PAYLOAD_MEDIA_TYPE, payload_digest, &artifacts.payload)?,
+        descriptor(ARCHIVE_MEDIA_TYPE, payload_digest, &artifacts.payload)?,
     ];
     let image = ImageManifest {
         schema_version: 2,
@@ -127,7 +127,7 @@ impl Artifacts {
         manifest.validate()?;
         let payload = directory.join("payload.tar.zst");
         let (digest, size) = Sha256Digest::calculate_reader(std::fs::File::open(&payload)?)?;
-        if digest != manifest.payload.digest || size != manifest.payload.size {
+        if digest != manifest.artifact.digest() || size != manifest.artifact.size() {
             anyhow::bail!("payload does not match manifest");
         }
         Ok(Self {

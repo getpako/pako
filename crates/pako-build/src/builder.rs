@@ -10,8 +10,9 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use pako_core::{
     canonical,
     manifest::{
-        DesktopEntry, Entry, Icon, Integrations, Launcher, PackageManifest, PackageMetadata,
-        Payload, Policies, PACKAGE_MANIFEST_MEDIA_TYPE, PAYLOAD_MEDIA_TYPE,
+        ArchiveDescriptor, ArchiveFormat, Artifact, DesktopEntry, Entry, Icon, InstallTransform,
+        Integrations, Launcher, PackageManifest, PackageMetadata, Policies,
+        PACKAGE_MANIFEST_MEDIA_TYPE,
     },
     path::{validate_symlink_target, PackagePath},
     verify::compute_tree_digest,
@@ -222,13 +223,28 @@ impl Builder {
                 homepage: recipe.metadata.homepage.clone(),
                 license: recipe.metadata.license.clone(),
             },
-            payload: Payload {
-                media_type: PAYLOAD_MEDIA_TYPE.into(),
+            artifact: Artifact::TufArchive {
+                target: format!(
+                    "artifacts/{}/{}/{}.tar.zst",
+                    recipe.package.name,
+                    version,
+                    target.platform.replace('/', "-")
+                ),
                 digest,
                 size,
+                archive: ArchiveDescriptor {
+                    format: ArchiveFormat::TarZst,
+                    strip_components: 0,
+                },
             },
             tree_digest: compute_tree_digest(&entries),
             entries,
+            transforms: recipe
+                .transforms
+                .iter()
+                .chain(target.transforms.iter())
+                .map(install_transform)
+                .collect::<anyhow::Result<_>>()?,
             integrations: integrations(recipe)?,
             policies: Policies {
                 payload_mutation: "deny".into(),
@@ -248,6 +264,47 @@ impl Builder {
             output,
         })
     }
+}
+
+fn install_transform(transform: &Transform) -> anyhow::Result<InstallTransform> {
+    Ok(match transform {
+        Transform::Remove { paths, required } => InstallTransform::Remove {
+            paths: paths
+                .iter()
+                .map(|p| PackagePath::new(p.clone()))
+                .collect::<pako_core::Result<_>>()?,
+            required: *required,
+        },
+        Transform::Chmod { path, mode } => InstallTransform::Chmod {
+            path: PackagePath::new(path.clone())?,
+            mode: u16::try_from(parse_mode(mode)?)?,
+        },
+        Transform::Move { from, to } => InstallTransform::Move {
+            from: PackagePath::new(from.clone())?,
+            to: PackagePath::new(to.clone())?,
+        },
+        Transform::Copy { from, to } => InstallTransform::Copy {
+            from: PackagePath::new(from.clone())?,
+            to: PackagePath::new(to.clone())?,
+        },
+        Transform::Write {
+            path,
+            mode,
+            content,
+        } => InstallTransform::Write {
+            path: PackagePath::new(path.clone())?,
+            mode: u16::try_from(parse_mode(mode)?)?,
+            content: content.clone(),
+        },
+        Transform::Symlink { path, target } => {
+            let path = PackagePath::new(path.clone())?;
+            validate_symlink_target(&path, target)?;
+            InstallTransform::Symlink {
+                path,
+                target: target.clone(),
+            }
+        }
+    })
 }
 
 fn apply_transforms<'a>(

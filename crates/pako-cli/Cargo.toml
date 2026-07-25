@@ -21,8 +21,8 @@ indicatif.workspace = true
 log.workspace = true
 pako-core = { path = "../pako-core" }
 pako-log = { path = "../pako-log" }
-pako-oci = { path = "../pako-oci" }
 pako-trust = { path = "../pako-trust" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

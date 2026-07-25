@@ -74,6 +74,7 @@ impl Ui {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn byte_progress(self, message: impl Into<String>, total: u64) -> ProgressBar {
         let progress = pako_log::add_progress(ProgressBar::new(total));
         progress.set_style(

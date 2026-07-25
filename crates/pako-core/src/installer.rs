@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -5,12 +7,12 @@ use std::{
 };
 
 use crate::{
-    canonical,
+    archive, canonical,
     error::IoContext,
     integrations,
     layout::Layout,
     manifest::PackageManifest,
-    payload, permissions,
+    permissions,
     receipt::{PackageState, Receipt},
     transaction::{activate_symlink, CommitPlan, Journal, PackageLock, Phase, RecoveryAction},
     verify, Error, Result, Sha256Digest,
@@ -19,9 +21,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct InstallRequest {
     pub repository: String,
-    pub oci_manifest_digest: Sha256Digest,
-    pub package_manifest_digest: Sha256Digest,
-    pub payload_digest: Sha256Digest,
+    pub manifest_target: String,
+    pub manifest_digest: Sha256Digest,
     pub channel: String,
 }
 
@@ -50,25 +51,28 @@ impl Installer {
         &self.layout
     }
 
-    /// Install one fully resolved package release from a verified payload archive.
+    /// Install one fully resolved package release from a verified artifact archive.
     #[allow(clippy::too_many_lines)]
     pub fn install(
         &self,
         manifest: &PackageManifest,
-        payload_path: &Path,
+        artifact_path: &Path,
         request: &InstallRequest,
     ) -> Result<Receipt> {
         manifest.validate()?;
-        let (payload_digest, payload_size) =
-            Sha256Digest::calculate_reader(File::open(payload_path).at(payload_path)?)?;
-        if payload_digest != manifest.payload.digest || payload_size != manifest.payload.size {
+        let (artifact_digest, artifact_size) =
+            Sha256Digest::calculate_reader(File::open(artifact_path).at(artifact_path)?)?;
+        if artifact_digest != manifest.artifact.digest()
+            || artifact_size != manifest.artifact.size()
+        {
             return Err(Error::Integrity {
-                path: payload_path.to_owned(),
+                path: artifact_path.to_owned(),
                 expected: format!(
                     "{} ({} bytes)",
-                    manifest.payload.digest, manifest.payload.size
+                    manifest.artifact.digest(),
+                    manifest.artifact.size()
                 ),
-                actual: format!("{payload_digest} ({payload_size} bytes)"),
+                actual: format!("{artifact_digest} ({artifact_size} bytes)"),
             });
         }
         log::info!(
@@ -102,7 +106,13 @@ impl Installer {
         journal.save(&self.layout)?;
 
         log::debug!("extracting payload at {}", staging.display());
-        payload::extract(payload_path, &staging)?;
+        archive::extract(
+            artifact_path,
+            manifest.artifact.archive().format,
+            &staging,
+            manifest.artifact.archive().strip_components,
+        )?;
+        apply_transforms(manifest, &staging)?;
         journal.advance(&self.layout, Phase::Materialized)?;
 
         log::debug!("verifying staged package tree");
@@ -120,9 +130,14 @@ impl Installer {
             release: manifest.release,
             target: manifest.target.clone(),
             repository: request.repository.clone(),
-            oci_manifest_digest: request.oci_manifest_digest,
-            package_manifest_digest: request.package_manifest_digest,
-            payload_digest: request.payload_digest,
+            manifest_target: request.manifest_target.clone(),
+            manifest_digest: request.manifest_digest,
+            artifact_digest,
+            artifact_type: match &manifest.artifact {
+                crate::manifest::Artifact::ExternalArchive { .. } => "external-archive",
+                crate::manifest::Artifact::TufArchive { .. } => "tuf-archive",
+            }
+            .into(),
             tree_digest: manifest.tree_digest,
             installed_at: now_seconds().to_string(),
             exposures: Vec::new(),
@@ -373,6 +388,88 @@ impl Installer {
 
 fn package_version(manifest: &PackageManifest) -> String {
     format!("{}-{}", manifest.upstream_version, manifest.release)
+}
+
+fn apply_transforms(manifest: &PackageManifest, root: &Path) -> anyhow::Result<()> {
+    use crate::manifest::InstallTransform;
+    for transform in &manifest.transforms {
+        match transform {
+            InstallTransform::Remove { paths, required } => {
+                for path in paths {
+                    let target = path.join_to(root);
+                    if target.exists() || target.symlink_metadata().is_ok() {
+                        remove_transform_path(&target)?;
+                    } else if *required {
+                        anyhow::bail!("required transform path does not exist: {path}");
+                    }
+                }
+            }
+            InstallTransform::Chmod { path, mode } => {
+                let target = path.join_to(root);
+                if target.symlink_metadata()?.file_type().is_symlink() {
+                    anyhow::bail!("cannot chmod symlink: {path}");
+                }
+                std::fs::set_permissions(
+                    target,
+                    std::fs::Permissions::from_mode(u32::from(*mode)),
+                )?;
+            }
+            InstallTransform::Move { from, to } => {
+                let source = from.join_to(root);
+                let destination = to.join_to(root);
+                ensure_transform_parent(root, &destination)?;
+                std::fs::rename(source, destination)?;
+            }
+            InstallTransform::Copy { from, to } => {
+                let source = from.join_to(root);
+                let destination = to.join_to(root);
+                ensure_transform_parent(root, &destination)?;
+                std::fs::copy(source, destination)?;
+            }
+            InstallTransform::Write {
+                path,
+                mode,
+                content,
+            } => {
+                let target = path.join_to(root);
+                ensure_transform_parent(root, &target)?;
+                std::fs::write(&target, content)?;
+                std::fs::set_permissions(
+                    target,
+                    std::fs::Permissions::from_mode(u32::from(*mode)),
+                )?;
+            }
+            InstallTransform::Symlink { path, target } => {
+                let destination = path.join_to(root);
+                ensure_transform_parent(root, &destination)?;
+                crate::path::validate_symlink_target(path, target)?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, destination)?;
+                #[cfg(not(unix))]
+                anyhow::bail!("symlink transforms are unsupported on this platform");
+            }
+        }
+    }
+    Ok(())
+}
+fn ensure_transform_parent(root: &Path, path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("transform path has no parent"))?;
+    if !parent.starts_with(root) {
+        anyhow::bail!("transform escaped staging");
+    }
+    std::fs::create_dir_all(parent)?;
+    Ok(())
+}
+fn remove_transform_path(path: &Path) -> anyhow::Result<()> {
+    let metadata = path.symlink_metadata()?;
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn resolve_current_target(current: &Path) -> Option<PathBuf> {

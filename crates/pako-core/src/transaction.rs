@@ -412,9 +412,10 @@ mod tests {
             release: 1,
             target: "x86_64-unknown-linux-gnu".into(),
             repository: "test".into(),
-            oci_manifest_digest: digest,
-            package_manifest_digest: digest,
-            payload_digest: digest,
+            manifest_target: "manifests/demo.json".into(),
+            manifest_digest: digest,
+            artifact_type: "tuf-archive".into(),
+            artifact_digest: digest,
             tree_digest: digest,
             installed_at: "0".into(),
             exposures: vec![ExposureReceipt {

@@ -5,7 +5,6 @@ use std::{
 };
 
 use jiff::{SignedDuration, Timestamp};
-use pako_core::Sha256Digest;
 use ring::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
@@ -40,8 +39,7 @@ pub(crate) struct Release {
     number: u32,
     channel: String,
     target: String,
-    oci: String,
-    manifest_digest: Sha256Digest,
+    manifest_target: String,
 }
 
 pub(crate) async fn init(directory: &Path) -> anyhow::Result<()> {
@@ -165,16 +163,14 @@ pub(crate) fn release(
     upstream_version: String,
     release: u32,
     target: String,
-    oci: String,
-    manifest_digest: Sha256Digest,
+    manifest_target: String,
 ) -> Release {
     Release {
         upstream_version,
         number: release,
         channel: "stable".into(),
         target,
-        oci,
-        manifest_digest,
+        manifest_target,
     }
 }
 

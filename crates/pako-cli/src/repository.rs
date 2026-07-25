@@ -1,16 +1,14 @@
+use crate::{cli::Concurrency, output::Ui};
 use pako_core::{
     installer::{InstallRequest, Installer},
-    manifest::{PackageManifest, PACKAGE_MANIFEST_MEDIA_TYPE, PAYLOAD_MEDIA_TYPE},
+    manifest::{Artifact, PackageManifest},
     receipt::{PackageState, Receipt},
     Sha256Digest,
 };
-use pako_oci::{ImageIndex, ImageManifest, OciClient, OciReference, Registry};
 use pako_trust::TrustedRepository;
 use serde::Deserialize;
-use std::{fs::File, path::PathBuf, str::FromStr};
+use std::{fs::File, path::PathBuf};
 use url::Url;
-
-use crate::{cli::Concurrency, output::Ui};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -43,6 +41,9 @@ pub(crate) struct RemoteInstallPlan {
     pub(crate) channel: String,
     pub(crate) target: String,
     pub(crate) manifest: PackageManifest,
+    pub(crate) manifest_target: String,
+    pub(crate) manifest_digest: Sha256Digest,
+    pub(crate) artifact: Artifact,
     pub(crate) download_bytes: u64,
     pub(crate) installed_bytes: u64,
     pub(crate) current_version: Option<String>,
@@ -50,11 +51,7 @@ pub(crate) struct RemoteInstallPlan {
     pub(crate) launcher_count: usize,
     pub(crate) desktop_entry_count: usize,
     pub(crate) icon_count: usize,
-    client: OciClient,
-    reference: OciReference,
-    platform_digest: Sha256Digest,
-    manifest_digest: Sha256Digest,
-    payload_digest: Sha256Digest,
+    trusted: TrustedRepository,
 }
 impl RemoteInstallPlan {
     pub(crate) fn version(&self) -> String {
@@ -81,52 +78,26 @@ pub(crate) async fn resolve_remote(
     concurrency: Concurrency,
     ui: Ui,
 ) -> anyhow::Result<RemoteInstallPlan> {
-    let repository = RepositoryConfig::load(installer.layout())?;
+    let config = RepositoryConfig::load(installer.layout())?;
+    if config.allow_insecure_http {
+        log::warn!("allowInsecureHttp is ignored for external artifacts; manifests require HTTPS");
+    }
     let trusted = TrustedRepository::new(
-        repository.root.clone(),
-        repository.metadata_url.clone(),
-        repository.targets_url.clone(),
-        installer.layout().state.join("tuf").join(&repository.name),
+        config.root.clone(),
+        config.metadata_url.clone(),
+        config.targets_url.clone(),
+        installer.layout().state.join("tuf").join(&config.name),
     );
     let catalog = trusted.refresh_catalog().await?;
     let target = host_target();
     let release = catalog.resolve(package, &target, channel)?;
-    let reference = OciReference::from_str(&release.oci)?.with_digest(release.manifest_digest);
-    let mut client = OciClient::new()?.with_download_limit(concurrency.download_jobs);
-    if repository.allow_insecure_http {
-        ensure_loopback_registry(&reference.registry)?;
-        client = client.insecure_http();
-    }
-    let step = ui.spinner("Resolving package metadata");
-    let platform = resolve_platform(&client, &reference, &target).await?;
-    let reference = reference.with_digest(platform.digest);
-    let image = fetch_image_manifest(&client, &reference).await?;
-    let manifest_descriptor = image
-        .layers
-        .iter()
-        .find(|d| d.media_type == PACKAGE_MANIFEST_MEDIA_TYPE)
-        .ok_or_else(|| anyhow::anyhow!("package manifest layer is missing"))?;
-    let payload_descriptor = image
-        .layers
-        .iter()
-        .find(|d| d.media_type == PAYLOAD_MEDIA_TYPE)
-        .ok_or_else(|| anyhow::anyhow!("payload layer is missing"))?;
-    let manifest_path = installer
-        .layout()
-        .staging()
-        .join(format!("manifest-{}", manifest_descriptor.digest.hex()));
-    client
-        .fetch_blob(&reference, manifest_descriptor.digest, &manifest_path)
-        .await?;
-    let manifest: PackageManifest = serde_json::from_reader(File::open(&manifest_path)?)?;
-    let _ = std::fs::remove_file(&manifest_path);
+    let manifest_bytes = trusted.read_target(&release.manifest_target).await?;
+    let manifest_digest = Sha256Digest::calculate(&manifest_bytes);
+    let manifest: PackageManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.validate()?;
-    if manifest.payload.digest != payload_descriptor.digest
-        || manifest.payload.size != payload_descriptor.size
-    {
-        anyhow::bail!("payload descriptor does not match package manifest");
+    if manifest.package != package || manifest.target != target {
+        anyhow::bail!("signed package manifest does not match catalog resolution");
     }
-    step.finish("Package metadata verified");
     let installed_bytes = manifest
         .entries
         .iter()
@@ -149,27 +120,36 @@ pub(crate) async fn resolve_remote(
         .as_ref()
         .map(|state| Receipt::load(&installer.layout().version_record(package, &state.active)?))
         .transpose()?
-        .is_some_and(|receipt| receipt.oci_manifest_digest == platform.digest);
+        .is_some_and(|receipt| {
+            receipt.manifest_target == release.manifest_target
+                && receipt.manifest_digest == manifest_digest
+        });
+    let step = ui.spinner("Package metadata verified");
+    step.finish("Package metadata verified");
+    log::debug!(
+        "configured download concurrency: {}",
+        concurrency.download_jobs
+    );
     Ok(RemoteInstallPlan {
         operation,
-        repository: repository.name,
+        repository: config.name,
         channel: channel.into(),
         target,
-        download_bytes: manifest.payload.size,
+        manifest_target: release.manifest_target.clone(),
+        manifest_digest,
+        download_bytes: manifest.artifact.size(),
         installed_bytes,
         current_version,
         up_to_date,
         launcher_count: manifest.integrations.launchers.len(),
         desktop_entry_count: manifest.integrations.desktop_entries.len(),
         icon_count: manifest.integrations.icons.len(),
+        artifact: manifest.artifact.clone(),
         manifest,
-        client,
-        reference,
-        platform_digest: platform.digest,
-        manifest_digest: manifest_descriptor.digest,
-        payload_digest: payload_descriptor.digest,
+        trusted,
     })
 }
+
 pub(crate) async fn execute_remote(
     installer: &Installer,
     plan: RemoteInstallPlan,
@@ -178,76 +158,90 @@ pub(crate) async fn execute_remote(
     if plan.up_to_date {
         return Ok(InstallOutcome::AlreadyCurrent);
     }
-    let path = installer
-        .layout()
-        .staging()
-        .join(format!("payload-{}.tar.zst", plan.payload_digest.hex()));
-    let progress = ui.byte_progress("Downloading package payload", plan.download_bytes);
-    plan.client
-        .fetch_blob_with_progress(&plan.reference, plan.payload_digest, &path, &progress)
-        .await?;
-    pako_log::finish_progress(&progress, "Downloaded package payload");
+    let path = fetch_artifact(installer, &plan, &ui).await?;
     let request = InstallRequest {
         repository: plan.repository,
-        oci_manifest_digest: plan.platform_digest,
-        package_manifest_digest: plan.manifest_digest,
-        payload_digest: plan.payload_digest,
+        manifest_target: plan.manifest_target,
+        manifest_digest: plan.manifest_digest,
         channel: plan.channel,
     };
     let local = installer.clone();
     let manifest = plan.manifest;
-    let install_path = path.clone();
     let result =
-        tokio::task::spawn_blocking(move || local.install(&manifest, &install_path, &request))
-            .await?;
-    let _ = std::fs::remove_file(&path);
-    Ok(InstallOutcome::Installed(Box::new(result?)))
+        tokio::task::spawn_blocking(move || local.install(&manifest, &path, &request)).await??;
+    Ok(InstallOutcome::Installed(Box::new(result)))
 }
-fn ensure_loopback_registry(registry: &str) -> anyhow::Result<()> {
-    if registry.starts_with("localhost")
-        || registry.starts_with("127.0.0.1")
-        || registry.starts_with("[::1]")
-    {
-        Ok(())
-    } else {
-        anyhow::bail!("allowInsecureHttp is permitted only for a loopback registry")
+
+async fn fetch_artifact(
+    installer: &Installer,
+    plan: &RemoteInstallPlan,
+    ui: &Ui,
+) -> anyhow::Result<PathBuf> {
+    let cache = installer.layout().cache.join("artifacts/sha256");
+    tokio::fs::create_dir_all(&cache).await?;
+    let path = cache.join(plan.artifact.digest().hex());
+    if path.exists() {
+        let (digest, size) = Sha256Digest::calculate_reader(File::open(&path)?)?;
+        if digest == plan.artifact.digest() && size == plan.artifact.size() {
+            return Ok(path);
+        }
+        let _ = std::fs::remove_file(&path);
     }
-}
-async fn resolve_platform(
-    client: &OciClient,
-    reference: &OciReference,
-    target: &str,
-) -> anyhow::Result<pako_oci::Descriptor> {
-    let (_, bytes) = client.fetch_manifest(reference).await?;
-    let index: ImageIndex = serde_json::from_slice(&bytes)?;
-    index
-        .manifests
-        .into_iter()
-        .find(|descriptor| {
-            descriptor.platform.as_ref().is_some_and(|platform| {
-                format!(
-                    "{}/{}",
-                    platform.os,
-                    normalize_architecture(&platform.architecture)
-                ) == target
-            })
-        })
-        .ok_or_else(|| anyhow::anyhow!("OCI index has no platform for {target}"))
-}
-async fn fetch_image_manifest(
-    client: &OciClient,
-    reference: &OciReference,
-) -> anyhow::Result<ImageManifest> {
-    let (_, bytes) = client.fetch_manifest(reference).await?;
-    Ok(serde_json::from_slice(&bytes)?)
+    let temporary = path.with_extension("partial");
+    match &plan.artifact {
+        Artifact::TufArchive { target, .. } => {
+            tokio::fs::write(&temporary, plan.trusted.read_target(target).await?).await?;
+        }
+        Artifact::ExternalArchive { urls, .. } => {
+            let client = reqwest::Client::new();
+            let mut errors = Vec::new();
+            for url in urls {
+                if url.scheme() != "https"
+                    && !(url.scheme() == "http"
+                        && url
+                            .host_str()
+                            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1")))
+                {
+                    errors.push(format!("{url}: HTTPS required"));
+                    continue;
+                }
+                match client
+                    .get(url.clone())
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                {
+                    Ok(response) => match response.bytes().await {
+                        Ok(bytes) => {
+                            tokio::fs::write(&temporary, &bytes).await?;
+                            break;
+                        }
+                        Err(error) => errors.push(format!("{url}: {error}")),
+                    },
+                    Err(error) => errors.push(format!("{url}: {error}")),
+                }
+            }
+            if !temporary.exists() {
+                anyhow::bail!("all artifact mirrors failed: {}", errors.join("; "));
+            }
+        }
+    }
+    let (digest, size) = Sha256Digest::calculate_reader(File::open(&temporary)?)?;
+    if digest != plan.artifact.digest() || size != plan.artifact.size() {
+        let _ = std::fs::remove_file(&temporary);
+        anyhow::bail!("downloaded artifact integrity mismatch");
+    }
+    std::fs::rename(&temporary, &path)?;
+    ui.note("Artifact verified and cached");
+    Ok(path)
 }
 fn host_target() -> String {
-    format!("linux/{}", normalize_architecture(std::env::consts::ARCH))
-}
-fn normalize_architecture(value: &str) -> &str {
-    match value {
-        "x86_64" | "amd64" => "x86_64",
-        "aarch64" | "arm64" => "aarch64",
-        _ => value,
-    }
+    format!(
+        "linux/{}",
+        match std::env::consts::ARCH {
+            "x86_64" | "amd64" => "x86_64",
+            "aarch64" | "arm64" => "aarch64",
+            value => value,
+        }
+    )
 }

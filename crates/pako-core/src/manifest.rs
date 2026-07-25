@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, str::FromStr};
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::{
     path::{
@@ -10,7 +11,7 @@ use crate::{
 };
 
 pub const PACKAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.pako.package-manifest.v1+json";
-pub const PAYLOAD_MEDIA_TYPE: &str = "application/vnd.pako.payload.v1+tar+zstd";
+pub const ARCHIVE_MEDIA_TYPE: &str = "application/vnd.pako.archive.v1";
 
 /// Complete, immutable description of one package release for one target.
 ///
@@ -26,9 +27,11 @@ pub struct PackageManifest {
     pub release: u32,
     pub target: String,
     pub metadata: PackageMetadata,
-    pub payload: Payload,
+    pub artifact: Artifact,
     pub tree_digest: Sha256Digest,
     pub entries: Vec<Entry>,
+    #[serde(default)]
+    pub transforms: Vec<InstallTransform>,
     #[serde(default)]
     pub integrations: Integrations,
     pub policies: Policies,
@@ -45,13 +48,93 @@ pub struct PackageMetadata {
     pub license: String,
 }
 
-/// The single compressed archive containing the complete package tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Artifact {
+    ExternalArchive {
+        urls: Vec<Url>,
+        digest: Sha256Digest,
+        size: u64,
+        archive: ArchiveDescriptor,
+    },
+    TufArchive {
+        target: String,
+        digest: Sha256Digest,
+        size: u64,
+        archive: ArchiveDescriptor,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Payload {
-    pub media_type: String,
-    pub digest: Sha256Digest,
-    pub size: u64,
+pub struct ArchiveDescriptor {
+    pub format: ArchiveFormat,
+    #[serde(default)]
+    pub strip_components: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArchiveFormat {
+    #[serde(rename = "tar")]
+    Tar,
+    #[serde(rename = "tar.gz")]
+    TarGz,
+    #[serde(rename = "tar.xz")]
+    TarXz,
+    #[serde(rename = "tar.zst")]
+    TarZst,
+    Zip,
+}
+
+impl ArchiveFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tar => "tar",
+            Self::TarGz => "tar.gz",
+            Self::TarXz => "tar.xz",
+            Self::TarZst => "tar.zst",
+            Self::Zip => "zip",
+        }
+    }
+}
+
+impl FromStr for ArchiveFormat {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "tar" => Ok(Self::Tar),
+            "tar.gz" => Ok(Self::TarGz),
+            "tar.xz" => Ok(Self::TarXz),
+            "tar.zst" => Ok(Self::TarZst),
+            "zip" => Ok(Self::Zip),
+            _ => Err(anyhow::anyhow!("unsupported archive format {value}")),
+        }
+    }
+}
+
+impl Artifact {
+    pub fn digest(&self) -> Sha256Digest {
+        match self {
+            Self::ExternalArchive { digest, .. } | Self::TufArchive { digest, .. } => *digest,
+        }
+    }
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::ExternalArchive { size, .. } | Self::TufArchive { size, .. } => *size,
+        }
+    }
+    pub fn archive(&self) -> &ArchiveDescriptor {
+        match self {
+            Self::ExternalArchive { archive, .. } | Self::TufArchive { archive, .. } => archive,
+        }
+    }
+}
+
+impl ArchiveDescriptor {
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +154,40 @@ pub enum Entry {
         path: PackagePath,
         target: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum InstallTransform {
+    Remove {
+        paths: Vec<PackagePath>,
+        #[serde(default = "default_true")]
+        required: bool,
+    },
+    Chmod {
+        path: PackagePath,
+        mode: u16,
+    },
+    Move {
+        from: PackagePath,
+        to: PackagePath,
+    },
+    Copy {
+        from: PackagePath,
+        to: PackagePath,
+    },
+    Write {
+        path: PackagePath,
+        mode: u16,
+        content: String,
+    },
+    Symlink {
+        path: PackagePath,
+        target: String,
+    },
+}
+const fn default_true() -> bool {
+    true
 }
 
 impl Entry {
@@ -157,8 +274,41 @@ impl PackageManifest {
             return Err(Error::InvalidManifest("release must be positive".into()));
         }
 
-        if self.payload.media_type != PAYLOAD_MEDIA_TYPE || self.payload.size == 0 {
-            return Err(Error::InvalidManifest("invalid payload descriptor".into()));
+        if self.artifact.size() == 0 {
+            return Err(Error::InvalidManifest(
+                "artifact size must be positive".into(),
+            ));
+        }
+        match &self.artifact {
+            Artifact::ExternalArchive { urls, .. } => {
+                if urls.is_empty() {
+                    return Err(Error::InvalidManifest(
+                        "artifact requires at least one URL".into(),
+                    ));
+                }
+                for url in urls {
+                    if url.scheme() != "https"
+                        && !(url.scheme() == "http"
+                            && url.host_str().is_some_and(|host| {
+                                matches!(host, "localhost" | "127.0.0.1" | "::1")
+                            }))
+                    {
+                        return Err(Error::InvalidManifest(format!(
+                            "artifact URL must use HTTPS: {url}"
+                        )));
+                    }
+                }
+            }
+            Artifact::TufArchive { target, .. } => {
+                if target.is_empty()
+                    || target.starts_with('/')
+                    || target
+                        .split('/')
+                        .any(|part| part.is_empty() || part == "." || part == "..")
+                {
+                    return Err(Error::InvalidManifest("unsafe TUF artifact target".into()));
+                }
+            }
         }
 
         if !matches!(self.target.as_str(), "linux/x86_64" | "linux/aarch64") {
@@ -318,5 +468,87 @@ fn validate_single_line(value: &str, field: &str) -> Result<()> {
         Err(Error::InvalidManifest(format!("invalid {field}")))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base(artifact: Artifact) -> PackageManifest {
+        PackageManifest {
+            schema_version: 1,
+            media_type: PACKAGE_MANIFEST_MEDIA_TYPE.into(),
+            package: "demo".into(),
+            upstream_version: "1.0".into(),
+            release: 1,
+            target: "linux/x86_64".into(),
+            metadata: PackageMetadata {
+                display_name: "Demo".into(),
+                summary: "Demo".into(),
+                description: "Demo".into(),
+                vendor: "Demo".into(),
+                homepage: "https://example.invalid".into(),
+                license: "MIT".into(),
+            },
+            artifact,
+            tree_digest: Sha256Digest::EMPTY,
+            entries: vec![],
+            transforms: vec![],
+            integrations: Integrations::default(),
+            policies: Policies {
+                payload_mutation: "deny".into(),
+                self_update: "external".into(),
+                user_data: "external".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn validates_external_archive_and_rejects_insecure_url() {
+        let artifact = Artifact::ExternalArchive {
+            urls: vec!["https://example.invalid/demo.tar.gz".parse().unwrap()],
+            digest: Sha256Digest::EMPTY,
+            size: 1,
+            archive: ArchiveDescriptor {
+                format: ArchiveFormat::TarGz,
+                strip_components: 1,
+            },
+        };
+        assert!(base(artifact).validate().is_ok());
+        let artifact = Artifact::ExternalArchive {
+            urls: vec!["http://example.invalid/demo.tar.gz".parse().unwrap()],
+            digest: Sha256Digest::EMPTY,
+            size: 1,
+            archive: ArchiveDescriptor {
+                format: ArchiveFormat::TarGz,
+                strip_components: 0,
+            },
+        };
+        assert!(base(artifact).validate().is_err());
+    }
+
+    #[test]
+    fn validates_tuf_target_and_rejects_traversal() {
+        let artifact = Artifact::TufArchive {
+            target: "artifacts/demo/a.tar.zst".into(),
+            digest: Sha256Digest::EMPTY,
+            size: 1,
+            archive: ArchiveDescriptor {
+                format: ArchiveFormat::TarZst,
+                strip_components: 0,
+            },
+        };
+        assert!(base(artifact).validate().is_ok());
+        let artifact = Artifact::TufArchive {
+            target: "../outside.tar.zst".into(),
+            digest: Sha256Digest::EMPTY,
+            size: 1,
+            archive: ArchiveDescriptor {
+                format: ArchiveFormat::TarZst,
+                strip_components: 0,
+            },
+        };
+        assert!(base(artifact).validate().is_err());
     }
 }

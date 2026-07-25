@@ -1,8 +1,8 @@
-//! TUF-backed mapping from package names to immutable OCI manifest digests.
+//! TUF-backed mapping from package names to signed package-manifest targets.
 
 use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
 
-use pako_core::{manifest::validate_package_name, Sha256Digest};
+use pako_core::manifest::validate_package_name;
 use serde::{Deserialize, Serialize};
 use tough::{IntoVec, RepositoryLoader, TargetName};
 use url::Url;
@@ -29,8 +29,7 @@ pub struct CatalogRelease {
     pub release: u32,
     pub channel: String,
     pub target: String,
-    pub oci: String,
-    pub manifest_digest: Sha256Digest,
+    pub manifest_target: String,
 }
 
 impl ReleaseCatalog {
@@ -45,6 +44,7 @@ impl ReleaseCatalog {
                 if release.release == 0 {
                     anyhow::bail!("release number must be positive for {}", package.name);
                 }
+                validate_target_name(&release.manifest_target)?;
                 if !matches!(release.target.as_str(), "linux/x86_64" | "linux/aarch64") {
                     anyhow::bail!("unsupported target {} for {}", release.target, package.name);
                 }
@@ -138,11 +138,7 @@ impl TrustedRepository {
         .load()
         .await?;
 
-        let target_name = TargetName::from_str("catalog.json")?;
-        let stream = repository.read_target(&target_name).await?.ok_or_else(|| {
-            anyhow::anyhow!("catalog.json is not present in signed targets metadata")
-        })?;
-        let bytes = stream.into_vec().await?;
+        let bytes = read_repository_target(&repository, "catalog.json").await?;
         let catalog: ReleaseCatalog = serde_json::from_slice(&bytes)?;
         catalog.validate()?;
         log::debug!(
@@ -151,4 +147,43 @@ impl TrustedRepository {
         );
         Ok(catalog)
     }
+
+    pub async fn read_target(&self, target: &str) -> anyhow::Result<Vec<u8>> {
+        validate_target_name(target)?;
+        tokio::fs::create_dir_all(&self.datastore).await?;
+        let trusted_root = tokio::fs::read(&self.root).await?;
+        let repository = RepositoryLoader::new(
+            &trusted_root,
+            self.metadata_url.clone(),
+            self.targets_url.clone(),
+        )
+        .datastore(self.datastore.clone())
+        .load()
+        .await?;
+        read_repository_target(&repository, target).await
+    }
+}
+
+async fn read_repository_target(
+    repository: &tough::Repository,
+    target: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let target_name = TargetName::from_str(target)?;
+    let stream = repository
+        .read_target(&target_name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("signed TUF target is not present: {target}"))?;
+    Ok(stream.into_vec().await?)
+}
+
+fn validate_target_name(target: &str) -> anyhow::Result<()> {
+    if target.is_empty()
+        || target.starts_with('/')
+        || target
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        anyhow::bail!("unsafe TUF target: {target}");
+    }
+    Ok(())
 }

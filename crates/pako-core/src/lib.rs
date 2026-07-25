@@ -1,5 +1,6 @@
 //! Registry-independent package and installation primitives.
 
+pub mod archive;
 pub mod canonical;
 pub mod digest;
 pub mod error;
@@ -8,7 +9,6 @@ pub mod integrations;
 pub mod layout;
 pub mod manifest;
 pub mod path;
-pub mod payload;
 mod permissions;
 pub mod receipt;
 pub mod transaction;

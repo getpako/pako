@@ -325,16 +325,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 &arguments.tuf,
                 manifest.package.clone(),
                 tuf::release(
-                    manifest.upstream_version,
+                    manifest.upstream_version.clone(),
                     manifest.release,
-                    manifest.target,
-                    reference.to_string(),
-                    digest,
+                    manifest.target.clone(),
+                    format!(
+                        "manifests/{}/{}-{}/{}.json",
+                        manifest.package,
+                        manifest.upstream_version,
+                        manifest.release,
+                        manifest.target.replace('/', "-")
+                    ),
                 ),
             )
             .await?;
             pako_log::suspend_progress(|| {
-                println!("published OCI image index: {digest}");
+                println!("published package artifact: {digest}");
                 println!("updated signed TUF catalog: {}", arguments.tuf.display());
             });
         }
