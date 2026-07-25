@@ -82,7 +82,10 @@ fn reset(context: &Context) -> Result<()> {
 }
 
 fn smoke(context: &Context) -> Result<()> {
-    up(context)?;
+    // Smoke tests must not reuse package or TUF state from a previous
+    // development run. In particular, the catalog format can change between
+    // revisions and is intentionally not migrated in-place.
+    reset(context)?;
     reset_client(context)?;
 
     let recipe = context.root().join("examples/hello-local/recipe.toml");

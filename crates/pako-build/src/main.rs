@@ -324,6 +324,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             tuf::add_release(
                 &arguments.tuf,
                 manifest.package.clone(),
+                &arguments.artifact,
                 tuf::release(
                     manifest.upstream_version.clone(),
                     manifest.release,

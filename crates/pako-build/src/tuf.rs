@@ -5,6 +5,7 @@ use std::{
 };
 
 use jiff::{SignedDuration, Timestamp};
+use pako_core::manifest::{Artifact, PackageManifest};
 use ring::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
@@ -13,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use tough::{
     editor::{signed::SignedRole, RepositoryEditor},
     key_source::LocalKeySource,
-    schema::{key::Key, KeyHolder, RoleKeys, RoleType, Root},
+    schema::{key::Key, KeyHolder, RoleKeys, RoleType, Root, Target},
+    TargetName,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,14 +113,32 @@ pub(crate) async fn init(directory: &Path) -> anyhow::Result<()> {
             packages: Vec::new(),
         })?,
     )?;
-    sign(directory, 1).await
+    sign(directory, 1, &[]).await
 }
 
 pub(crate) async fn add_release(
     directory: &Path,
     package_name: String,
+    artifact_directory: &Path,
     release: Release,
 ) -> anyhow::Result<()> {
+    let manifest_path = artifact_directory.join("package-manifest.json");
+    let manifest: PackageManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let artifact_path = match &manifest.artifact {
+        Artifact::TufArchive { target, .. } => target,
+        Artifact::ExternalArchive { .. } => {
+            anyhow::bail!("external artifacts cannot be published to the TUF repository")
+        }
+    };
+    let manifest_target = release.manifest_target.clone();
+    let artifact_target = artifact_path.clone();
+    copy_target(directory, &manifest_target, &manifest_path)?;
+    copy_target(
+        directory,
+        &artifact_target,
+        &artifact_directory.join("payload.tar.zst"),
+    )?;
+
     let catalog_path = directory.join("targets/catalog.json");
     let mut catalog: Catalog = serde_json::from_slice(&std::fs::read(&catalog_path)?)?;
     let position = catalog
@@ -155,6 +175,7 @@ pub(crate) async fn add_release(
     sign(
         directory,
         next_version(&directory.join("metadata/targets.json"))?,
+        &[manifest_target.as_str(), artifact_target.as_str()],
     )
     .await
 }
@@ -174,7 +195,7 @@ pub(crate) fn release(
     }
 }
 
-async fn sign(directory: &Path, version: u64) -> anyhow::Result<()> {
+async fn sign(directory: &Path, version: u64, extra_targets: &[&str]) -> anyhow::Result<()> {
     let metadata = directory.join("metadata");
     let root = metadata.join("root.json");
     let key = directory.join("keys/targets-and-metadata.ed25519.pk8");
@@ -189,10 +210,23 @@ async fn sign(directory: &Path, version: u64) -> anyhow::Result<()> {
         .timestamp_version(NonZeroU64::new(version).unwrap())
         .add_target_path(directory.join("targets/catalog.json"))
         .await?;
+    for target in extra_targets {
+        let path = directory.join("targets").join(target);
+        editor.add_target(TargetName::new(*target)?, Target::from_path(path).await?)?;
+    }
     let repository = editor
         .sign(&[Box::new(LocalKeySource { path: key })])
         .await?;
     repository.write(metadata).await?;
+    Ok(())
+}
+
+fn copy_target(directory: &Path, target: &str, source: &Path) -> anyhow::Result<()> {
+    let destination = directory.join("targets").join(target);
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, destination)?;
     Ok(())
 }
 
