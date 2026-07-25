@@ -10,11 +10,13 @@ version only after complete integrity verification.
 ## Architecture
 
 A package release is represented by a canonical file-tree manifest and one
-SHA-256-addressed `payload.tar.zst` archive. The manifest and payload are
-distributed as OCI blobs, and signed TUF metadata resolves package releases to
-immutable OCI manifests. Pako safely extracts the payload into a staging
-directory, verifies every declared entry and the final tree digest, then
-atomically activates the completed version.
+SHA-256-addressed `payload.tar.zst` archive. Signed TUF metadata resolves a
+package release to its manifest and archive targets. Pako safely extracts the
+payload into a staging directory, verifies every declared entry and the final
+tree digest, then atomically activates the completed version.
+
+See the [documentation index](docs/README.md) for focused guides on usage,
+recipes, publishing, development, architecture, and security.
 
 ## Workspace
 
