@@ -73,21 +73,6 @@ impl Ui {
             finished: false,
         }
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn byte_progress(self, message: impl Into<String>, total: u64) -> ProgressBar {
-        let progress = pako_log::add_progress(ProgressBar::new(total));
-        progress.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-            )
-            .expect("byte progress template is valid")
-            .progress_chars("#>-"),
-        );
-        progress.set_message(message.into());
-        progress.enable_steady_tick(Duration::from_millis(100));
-        progress
-    }
 }
 
 #[derive(Debug)]

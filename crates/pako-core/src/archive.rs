@@ -120,3 +120,79 @@ fn ensure_safe(root: &Path, output: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn write_archive(entries: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> tempfile::NamedTempFile {
+        let mut builder = tar::Builder::new(Vec::new());
+        entries(&mut builder);
+        let bytes = builder.into_inner().expect("archive should finish");
+        let mut file = tempfile::NamedTempFile::new().expect("temporary archive should open");
+        std::io::Write::write_all(&mut file, &bytes).expect("archive should be written");
+        file
+    }
+
+    fn file_header(path: &str) -> tar::Header {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).expect("test path should be valid");
+        header.set_size(4);
+        header.set_mode(0o644);
+        header.set_cksum();
+        header
+    }
+
+    #[test]
+    fn rejects_absolute_archive_path() {
+        let archive = write_archive(|builder| {
+            let mut header = file_header("escape");
+            header
+                .set_path_absolute("/escape")
+                .expect("absolute test path should be valid");
+            header.set_cksum();
+            builder
+                .append(&header, Cursor::new(b"data"))
+                .expect("test archive should be written");
+        });
+        let destination = tempdir().expect("temporary destination should open");
+
+        let result = extract(archive.path(), ArchiveFormat::Tar, destination.path(), 0);
+
+        assert!(result.is_err());
+        assert!(!destination.path().join("escape").exists());
+    }
+
+    #[test]
+    fn rejects_writing_through_archive_symlink() {
+        let archive = write_archive(|builder| {
+            let mut symlink = tar::Header::new_gnu();
+            symlink.set_path("link").expect("test path should be valid");
+            symlink.set_entry_type(tar::EntryType::Symlink);
+            symlink
+                .set_link_name("target")
+                .expect("test link should be valid");
+            symlink.set_mode(0o777);
+            symlink.set_cksum();
+            builder
+                .append(&symlink, Cursor::new([]))
+                .expect("test symlink should be written");
+            builder
+                .append_data(
+                    &mut file_header("link/file"),
+                    "link/file",
+                    Cursor::new(b"data"),
+                )
+                .expect("test file should be written");
+        });
+        let destination = tempdir().expect("temporary destination should open");
+
+        let result = extract(archive.path(), ArchiveFormat::Tar, destination.path(), 0);
+
+        assert!(result.is_err());
+    }
+}

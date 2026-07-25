@@ -1,9 +1,15 @@
 //! TUF-backed mapping from package names to signed package-manifest targets.
 
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
+use futures_util::StreamExt;
 use pako_core::manifest::validate_package_name;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tough::{IntoVec, RepositoryLoader, TargetName};
 use url::Url;
 
@@ -161,6 +167,40 @@ impl TrustedRepository {
         .load()
         .await?;
         read_repository_target(&repository, target).await
+    }
+
+    pub async fn read_target_to_file(
+        &self,
+        target: &str,
+        destination: &Path,
+    ) -> anyhow::Result<()> {
+        validate_target_name(target)?;
+        tokio::fs::create_dir_all(
+            destination
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("target destination has no parent"))?,
+        )
+        .await?;
+        let trusted_root = tokio::fs::read(&self.root).await?;
+        let repository = RepositoryLoader::new(
+            &trusted_root,
+            self.metadata_url.clone(),
+            self.targets_url.clone(),
+        )
+        .datastore(self.datastore.clone())
+        .load()
+        .await?;
+        let target_name = TargetName::from_str(target)?;
+        let mut stream = repository
+            .read_target(&target_name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("signed TUF target is not present: {target}"))?;
+        let mut file = tokio::fs::File::create(destination).await?;
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+        file.flush().await?;
+        Ok(())
     }
 }
 

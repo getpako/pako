@@ -1,4 +1,5 @@
 use crate::{cli::Concurrency, output::Ui};
+use futures_util::StreamExt;
 use pako_core::{
     installer::{InstallRequest, Installer},
     manifest::{Artifact, PackageManifest},
@@ -8,6 +9,7 @@ use pako_core::{
 use pako_trust::TrustedRepository;
 use serde::Deserialize;
 use std::{fs::File, path::PathBuf};
+use tokio::{fs::File as AsyncFile, io::AsyncWriteExt};
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -190,7 +192,7 @@ async fn fetch_artifact(
     let temporary = path.with_extension("partial");
     match &plan.artifact {
         Artifact::TufArchive { target, .. } => {
-            tokio::fs::write(&temporary, plan.trusted.read_target(target).await?).await?;
+            plan.trusted.read_target_to_file(target, &temporary).await?;
         }
         Artifact::ExternalArchive { urls, .. } => {
             let client = reqwest::Client::new();
@@ -211,13 +213,15 @@ async fn fetch_artifact(
                     .await
                     .and_then(reqwest::Response::error_for_status)
                 {
-                    Ok(response) => match response.bytes().await {
-                        Ok(bytes) => {
-                            tokio::fs::write(&temporary, &bytes).await?;
-                            break;
+                    Ok(response) => {
+                        let mut stream = response.bytes_stream();
+                        let mut file = AsyncFile::create(&temporary).await?;
+                        while let Some(chunk) = stream.next().await {
+                            file.write_all(&chunk?).await?;
                         }
-                        Err(error) => errors.push(format!("{url}: {error}")),
-                    },
+                        file.flush().await?;
+                        break;
+                    }
                     Err(error) => errors.push(format!("{url}: {error}")),
                 }
             }

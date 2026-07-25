@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -11,6 +12,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use walkdir::WalkDir;
 
 use crate::{context::Context, process, DevCommand};
 
@@ -70,6 +72,7 @@ fn reset(context: &Context) -> Result<()> {
     }
 
     if context.dev().exists() {
+        make_removable(context.dev())?;
         fs::remove_dir_all(context.dev()).with_context(|| {
             format!(
                 "failed to remove development state at {}",
@@ -79,6 +82,19 @@ fn reset(context: &Context) -> Result<()> {
     }
 
     up(context)
+}
+
+fn make_removable(root: &Path) -> Result<()> {
+    for entry in WalkDir::new(root).contents_first(true).follow_links(false) {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(entry.path(), fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 fn smoke(context: &Context) -> Result<()> {

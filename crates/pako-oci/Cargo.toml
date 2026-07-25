@@ -18,7 +18,6 @@ log.workspace = true
 pako-core = { path = "../pako-core" }
 reqwest.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 url.workspace = true
