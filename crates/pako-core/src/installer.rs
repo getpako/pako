@@ -10,7 +10,7 @@ use crate::{
     integrations,
     layout::Layout,
     manifest::PackageManifest,
-    payload,
+    payload, permissions,
     receipt::{PackageState, Receipt},
     transaction::{activate_symlink, CommitPlan, Journal, PackageLock, Phase, RecoveryAction},
     verify, Error, Result, Sha256Digest,
@@ -172,8 +172,17 @@ impl Installer {
         });
         journal.save(&self.layout)?;
 
+        // The payload has been fully verified and is no longer modified. Keep
+        // the staging root writable for its atomic rename, while making all of
+        // its contents immutable before publication.
+        permissions::make_contents_immutable(&staging)?;
         commit_tree(&staging, &final_path)?;
         journal.advance(&self.layout, Phase::TreeCommitted)?;
+
+        // The version root itself becomes read-only only after the rename: on
+        // Linux, moving a directory requires write access to that directory.
+        // Rollback recovery restores directory write bits before deletion.
+        permissions::make_immutable(&final_path)?;
 
         // This durable intent is the transaction boundary. From here recovery
         // must complete the new version, never infer intent from final_path.
@@ -391,6 +400,7 @@ fn remove_symlink_if_present(path: &Path) -> Result<()> {
 
 fn remove_directory_if_present(path: &Path) -> Result<()> {
     if path.exists() {
+        permissions::make_removable(path)?;
         std::fs::remove_dir_all(path).at(path)?;
     }
     Ok(())

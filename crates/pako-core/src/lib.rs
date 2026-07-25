@@ -9,6 +9,7 @@ pub mod layout;
 pub mod manifest;
 pub mod path;
 pub mod payload;
+mod permissions;
 pub mod receipt;
 pub mod transaction;
 pub mod verify;

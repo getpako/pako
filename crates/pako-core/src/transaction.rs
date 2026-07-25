@@ -12,6 +12,7 @@ use crate::{
     integrations::{self, PreparedExposure},
     layout::Layout,
     manifest::validate_package_name,
+    permissions,
     receipt::{sync_directory, PackageState, Receipt},
     Error, Result,
 };
@@ -275,9 +276,11 @@ fn recover_rollback(
         integrations::ExposureTransaction::recover_rollback(layout, &commit.exposures)?;
     }
     if staging.exists() {
+        permissions::make_removable(staging)?;
         std::fs::remove_dir_all(staging).at(staging)?;
     }
     if final_path.exists() {
+        permissions::make_removable(final_path)?;
         std::fs::remove_dir_all(final_path).at(final_path)?;
     }
 

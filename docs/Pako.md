@@ -219,7 +219,9 @@ exercise the production path layout without touching a developer's XDG state.
 Each package has an exclusive file lock. Once a tree is verified, it is renamed from
 staging to the versioned cellar on the same filesystem. Activation creates a
 temporary symlink and atomically renames it over `apps/<package>/current`; installed
-version directories remain immutable and are retained for rollback.
+version directories have every write bit removed and are retained for rollback.
+Pako temporarily restores owner write access to their directories only when pruning,
+removing, or rolling back an interrupted transaction.
 
 Integrations are handled under a separate global exposure lock because different
 packages can otherwise race to claim the same launcher, desktop file, or icon.
