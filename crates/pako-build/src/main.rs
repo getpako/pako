@@ -1,6 +1,5 @@
 mod archive;
 mod builder;
-mod publisher;
 mod recipe;
 mod sandbox;
 mod tuf;
@@ -13,8 +12,8 @@ const ROOT_LONG_ABOUT: &str = "\
 Build Pako package artifacts from a versioned recipe.
 
 `pako-build` is a maintainer tool. It validates recipe files, fetches and
-verifies pinned sources, prepares a package payload for one target, audits the
-result and writes a `payload.tar.zst` archive plus the generated package manifest.
+verifies pinned sources, prepares one target, audits the result and writes a
+package manifest plus an optional `package.tar.zst` archive for hosted packages.
 
 Build scripts from source recipes run only in the configured build sandbox.
 They are never included in, or executed by, the end-user Pako client.";
@@ -59,9 +58,9 @@ For a source target, the builder prepares pinned sources and executes declared
 prepare, configure, build, check, and install stages inside the configured
 sandbox. The install stage must place the final payload in `PAKO_DESTDIR`.
 
-After payload validation, the builder creates deterministic package metadata,
-one `payload.tar.zst` archive and a package manifest in the selected output
-directory. This command does not publish artifacts to a registry.";
+After tree validation, the builder creates deterministic package metadata. An
+external package keeps its upstream archive URL and digest in the manifest;
+hosted packages also receive a `package.tar.zst` archive.";
 
 const BUILD_AFTER_HELP: &str = "\
 Examples:
@@ -76,7 +75,7 @@ Examples:
 
 Generated files include:
   package-manifest.json
-  payload.tar.zst";
+  package.tar.zst (hosted targets only)";
 
 /// Command-line interface for package maintainers.
 #[derive(Debug, Parser)]
@@ -105,11 +104,11 @@ enum Command {
     #[command(long_about = LINT_LONG_ABOUT, after_help = LINT_AFTER_HELP)]
     Lint(LintArgs),
 
-    /// Build one target into a manifest and payload archive.
+    /// Build one target into a manifest and, for hosted targets, an archive.
     #[command(long_about = BUILD_LONG_ABOUT, after_help = BUILD_AFTER_HELP)]
     Build(BuildArgs),
 
-    /// Publish verified build artifacts as an OCI image index.
+    /// Publish verified build artifacts directly to TUF.
     #[command(long_about = PUBLISH_LONG_ABOUT, after_help = PUBLISH_AFTER_HELP)]
     Publish(PublishArgs),
 
@@ -139,7 +138,7 @@ struct BuildArgs {
     #[arg(long, value_name = "TARGET")]
     target: String,
 
-    /// Directory in which generated manifests and payload archive are
+    /// Directory in which generated manifests and hosted archive are
     /// written.
     #[arg(long, value_name = "DIRECTORY", default_value = "build")]
     output: PathBuf,
@@ -151,21 +150,12 @@ struct BuildArgs {
 }
 
 const PUBLISH_LONG_ABOUT: &str = "\
-Upload a verified pako-build artifact directory to an OCI registry.
-
-The command verifies the package manifest and payload archive before uploading.
-It publishes an OCI platform manifest by digest and then an
-OCI image index at the requested tag. It then updates and signs `catalog.json`
-in the supplied local TUF repository.";
+Publish a verified package manifest and optional hosted archive directly to a
+local TUF repository. External upstream archives are not downloaded or copied.";
 
 const PUBLISH_AFTER_HELP: &str = "\
 Examples:
   pako-build publish build/hello-local/hello-local/1.0.0-1/linux_x86_64 \\
-    --reference registry.example.org/pako/hello-local:1.0.0-1-linux-x86_64 \\
-    --tuf /srv/pako/tuf
-
-  pako-build publish build/hello-local/hello-local/1.0.0-1/linux_x86_64 \\
-    --reference localhost:5000/pako/hello-local:dev --insecure-http \\
     --tuf /tmp/pako-tuf-dev";
 
 /// Arguments accepted by `pako-build publish`.
@@ -175,30 +165,9 @@ struct PublishArgs {
     #[arg(value_name = "ARTIFACT")]
     artifact: PathBuf,
 
-    /// Local TUF repository to update after OCI publication.
+    /// Local TUF repository to update.
     #[arg(long, value_name = "DIRECTORY")]
     tuf: PathBuf,
-
-    /// OCI repository and tag to update.
-    #[arg(long, value_name = "REFERENCE")]
-    reference: pako_oci::OciReference,
-
-    /// Use HTTP rather than HTTPS; intended only for a local development registry.
-    #[arg(long)]
-    insecure_http: bool,
-
-    /// OCI basic-auth username; may also be supplied as `PAKO_OCI_USERNAME`.
-    #[arg(long, env = "PAKO_OCI_USERNAME", requires = "password")]
-    username: Option<String>,
-
-    /// OCI basic-auth password; may also be supplied as `PAKO_OCI_PASSWORD`.
-    #[arg(
-        long,
-        env = "PAKO_OCI_PASSWORD",
-        requires = "username",
-        hide_env_values = true
-    )]
-    password: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -309,19 +278,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Publish(arguments) => {
             log::info!(
-                "publishing artifact {} to {}",
-                arguments.artifact.display(),
-                arguments.reference
+                "publishing artifact {} to TUF",
+                arguments.artifact.display()
             );
-            let credentials = arguments.username.zip(arguments.password);
-            let reference = arguments.reference.clone();
-            let digest = publisher::publish(
-                &arguments.artifact,
-                reference.clone(),
-                arguments.insecure_http,
-                credentials,
-            )
-            .await?;
             let artifact = std::fs::read(arguments.artifact.join("package-manifest.json"))?;
             let manifest: pako_core::PackageManifest = serde_json::from_slice(&artifact)?;
             log::info!("updating signed TUF catalog");
@@ -344,7 +303,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
             pako_log::suspend_progress(|| {
-                println!("published package artifact: {digest}");
+                println!("published package manifest and hosted archive when present");
                 println!("updated signed TUF catalog: {}", arguments.tuf.display());
             });
         }

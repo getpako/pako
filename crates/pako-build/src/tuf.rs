@@ -124,20 +124,20 @@ pub(crate) async fn add_release(
 ) -> anyhow::Result<()> {
     let manifest_path = artifact_directory.join("package-manifest.json");
     let manifest: PackageManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
-    let artifact_path = match &manifest.artifact {
-        Artifact::TufArchive { target, .. } => target,
-        Artifact::ExternalArchive { .. } => {
-            anyhow::bail!("external artifacts cannot be published to the TUF repository")
-        }
-    };
+    manifest.validate()?;
     let manifest_target = release.manifest_target.clone();
-    let artifact_target = artifact_path.clone();
+    let mut published_targets = vec![manifest_target.clone()];
     copy_target(directory, &manifest_target, &manifest_path)?;
-    copy_target(
-        directory,
-        &artifact_target,
-        &artifact_directory.join("payload.tar.zst"),
-    )?;
+    if let Artifact::TufArchive { target, .. } = &manifest.artifact {
+        let artifact_path = artifact_directory.join("package.tar.zst");
+        let (digest, size) =
+            pako_core::Sha256Digest::calculate_reader(std::fs::File::open(&artifact_path)?)?;
+        if digest != manifest.artifact.digest() || size != manifest.artifact.size() {
+            anyhow::bail!("package archive does not match manifest");
+        }
+        copy_target(directory, target, &artifact_path)?;
+        published_targets.push(target.clone());
+    }
 
     let catalog_path = directory.join("targets/catalog.json");
     let mut catalog: Catalog = serde_json::from_slice(&std::fs::read(&catalog_path)?)?;
@@ -171,11 +171,17 @@ pub(crate) async fn add_release(
     catalog
         .packages
         .sort_by(|left, right| left.name.cmp(&right.name));
-    std::fs::write(catalog_path, serde_json::to_vec_pretty(&catalog)?)?;
+    let catalog_bytes = serde_json::to_vec_pretty(&catalog)?;
+    let catalog_temporary = directory.join("targets/catalog.json.partial");
+    std::fs::write(&catalog_temporary, catalog_bytes)?;
+    std::fs::rename(catalog_temporary, catalog_path)?;
     sign(
         directory,
         next_version(&directory.join("metadata/targets.json"))?,
-        &[manifest_target.as_str(), artifact_target.as_str()],
+        &published_targets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     )
     .await
 }
