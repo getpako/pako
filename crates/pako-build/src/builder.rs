@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures_util::{stream, StreamExt, TryStreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use pako_core::{
     canonical,
     manifest::{
@@ -19,6 +20,7 @@ use pako_core::{
     Sha256Digest,
 };
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use walkdir::WalkDir;
 
 use crate::{
@@ -140,27 +142,32 @@ impl Builder {
             let client = client.clone();
             let recipe_directory = recipe_directory.clone();
             let downloaded = work.join(format!("source-{number}"));
+            let work = work.to_owned();
             async move {
+                let expected: Sha256Digest = source.hash.parse()?;
                 if let Some(path) = &source.path {
                     std::fs::copy(recipe_directory.join(path), &downloaded)?;
                 } else {
-                    let url = source
-                        .urls
-                        .first()
-                        .ok_or_else(|| anyhow::anyhow!("source has no URL"))?;
-                    let bytes = client
-                        .get(url)
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .bytes()
-                        .await?;
-                    tokio::fs::write(&downloaded, bytes).await?;
+                    download_source(
+                        &client,
+                        &source.urls,
+                        source.size,
+                        expected,
+                        &downloaded,
+                        &work,
+                        number,
+                    )
+                    .await?;
                 }
-                let (digest, _) = Sha256Digest::calculate_reader(File::open(&downloaded)?)?;
-                let expected: Sha256Digest = source.hash.parse()?;
+                let (digest, size) = Sha256Digest::calculate_reader(File::open(&downloaded)?)?;
                 if digest != expected {
                     anyhow::bail!("source digest mismatch for source {number}");
+                }
+                if source.size.is_some_and(|expected| expected != size) {
+                    anyhow::bail!(
+                        "source size mismatch for source {number}: expected {}, got {size}",
+                        source.size.unwrap_or_default()
+                    );
                 }
                 Ok::<_, anyhow::Error>((number, source, downloaded))
             }
@@ -308,6 +315,108 @@ impl Builder {
             output,
         })
     }
+}
+
+async fn download_source(
+    client: &reqwest::Client,
+    urls: &[String],
+    expected_size: Option<u64>,
+    expected_digest: Sha256Digest,
+    destination: &Path,
+    work: &Path,
+    number: usize,
+) -> anyhow::Result<()> {
+    if urls.is_empty() {
+        anyhow::bail!("source has no URL");
+    }
+
+    let mut errors = Vec::new();
+    for (mirror, url) in urls.iter().enumerate() {
+        let temporary = work.join(format!(
+            "source-{number}.partial-{}-{mirror}",
+            std::process::id()
+        ));
+        match download_mirror(client, url, expected_size, &temporary).await {
+            Ok(()) => {
+                let (digest, size) = Sha256Digest::calculate_reader(File::open(&temporary)?)?;
+                if digest != expected_digest {
+                    errors.push(format!("{url}: SHA-256 digest mismatch"));
+                    let _ = std::fs::remove_file(&temporary);
+                    continue;
+                }
+                if expected_size.is_some_and(|expected| expected != size) {
+                    errors.push(format!("{url}: actual size mismatch"));
+                    let _ = std::fs::remove_file(&temporary);
+                    continue;
+                }
+                std::fs::rename(&temporary, destination)?;
+                return Ok(());
+            }
+            Err(error) => {
+                errors.push(format!("{url}: {error}"));
+                let _ = std::fs::remove_file(&temporary);
+            }
+        }
+    }
+
+    anyhow::bail!("all source mirrors failed: {}", errors.join("; "))
+}
+
+async fn download_mirror(
+    client: &reqwest::Client,
+    url: &str,
+    expected_size: Option<u64>,
+    temporary: &Path,
+) -> anyhow::Result<()> {
+    let response = client.get(url).send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .zip(expected_size)
+        .is_some_and(|(actual, expected)| actual != expected)
+    {
+        anyhow::bail!("Content-Length does not match declared source size");
+    }
+
+    let progress = source_progress(expected_size, url);
+    let mut stream = response.bytes_stream();
+    let mut file = tokio::fs::File::create(temporary).await?;
+    let mut downloaded = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        downloaded = downloaded
+            .checked_add(u64::try_from(chunk.len())?)
+            .ok_or_else(|| anyhow::anyhow!("source size overflow"))?;
+        if expected_size.is_some_and(|expected| downloaded > expected) {
+            pako_log::abandon_progress(&progress, "Source download exceeded declared size");
+            anyhow::bail!("source download exceeded declared size");
+        }
+        file.write_all(&chunk).await?;
+        progress.set_position(downloaded);
+    }
+    file.flush().await?;
+    if expected_size.is_some_and(|expected| downloaded != expected) {
+        pako_log::abandon_progress(&progress, "Source download ended early");
+        anyhow::bail!("source download ended before declared size");
+    }
+    pako_log::finish_progress(&progress, format!("Downloaded {url}"));
+    Ok(())
+}
+
+fn source_progress(expected_size: Option<u64>, url: &str) -> ProgressBar {
+    let progress = pako_log::add_progress(
+        expected_size.map_or_else(ProgressBar::new_spinner, ProgressBar::new),
+    );
+    let template = if expected_size.is_some() {
+        "{spinner:.green} {msg} [{bar:35.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}"
+    } else {
+        "{spinner:.green} {msg} {bytes} {bytes_per_sec}"
+    };
+    progress.set_style(
+        ProgressStyle::with_template(template).expect("source download progress template is valid"),
+    );
+    progress.set_message(format!("Downloading {url}"));
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
 }
 
 fn install_transform(transform: &Transform) -> anyhow::Result<InstallTransform> {

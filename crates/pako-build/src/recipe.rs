@@ -343,6 +343,19 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
         anyhow::bail!("source size must be positive");
     }
 
+    for value in &source.urls {
+        let url: url::Url = value.parse()?;
+        let loopback = url
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
+        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+            anyhow::bail!("remote source URL must use HTTPS: {value}");
+        }
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            anyhow::bail!("remote source URL must not contain credentials or a fragment");
+        }
+    }
+
     if source.format.is_none() {
         if let Some(destination) = &source.destination {
             PackagePath::new(destination.clone())?;
