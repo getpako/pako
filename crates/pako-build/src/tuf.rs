@@ -116,6 +116,12 @@ pub(crate) async fn init(directory: &Path) -> anyhow::Result<()> {
     sign(directory, 1, &[]).await
 }
 
+pub(crate) async fn refresh(directory: &Path) -> anyhow::Result<()> {
+    let targets_metadata = directory.join("metadata/targets.json");
+    let version = next_version(&targets_metadata)?;
+    sign(directory, version, &[]).await
+}
+
 pub(crate) async fn add_release(
     directory: &Path,
     package_name: String,
@@ -206,13 +212,13 @@ async fn sign(directory: &Path, version: u64, extra_targets: &[&str]) -> anyhow:
     let root = metadata.join("root.json");
     let key = directory.join("keys/targets-and-metadata.ed25519.pk8");
     let mut editor = RepositoryEditor::new(&root).await?;
-    let expires = Timestamp::now() + SignedDuration::from_hours(30 * 24);
+    let now = Timestamp::now();
     editor
-        .targets_expires(expires)?
+        .targets_expires(now + SignedDuration::from_hours(90 * 24))?
         .targets_version(NonZeroU64::new(version).unwrap())?
-        .snapshot_expires(expires)
+        .snapshot_expires(now + SignedDuration::from_hours(30 * 24))
         .snapshot_version(NonZeroU64::new(version).unwrap())
-        .timestamp_expires(expires)
+        .timestamp_expires(now + SignedDuration::from_hours(7 * 24))
         .timestamp_version(NonZeroU64::new(version).unwrap())
         .add_target_path(directory.join("targets/catalog.json"))
         .await?;

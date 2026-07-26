@@ -185,7 +185,8 @@ a dedicated signing system.";
 
 const TUF_AFTER_HELP: &str = "\
 Example:
-  pako-build tuf init /srv/pako/tuf";
+  pako-build tuf init /srv/pako/tuf
+  pako-build tuf refresh /srv/pako/tuf";
 
 #[derive(Debug, Subcommand)]
 enum TufCommand {
@@ -199,6 +200,17 @@ root, targets, snapshot, and timestamp metadata.",
     )]
     Init {
         /// New directory in which metadata, targets, and the development key are created.
+        #[arg(value_name = "DIRECTORY")]
+        directory: PathBuf,
+    },
+
+    /// Refresh signed targets, snapshot, and timestamp metadata in place.
+    #[command(
+        long_about = "Refresh signed targets, snapshot, and timestamp metadata without changing the catalog or target set.",
+        after_help = "The repository must have a usable signing key under keys/."
+    )]
+    Refresh {
+        /// Existing TUF repository directory.
         #[arg(value_name = "DIRECTORY")]
         directory: PathBuf,
     },
@@ -313,6 +325,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 tuf::init(&directory).await?;
                 pako_log::suspend_progress(|| {
                     println!("initialized local TUF repository: {}", directory.display());
+                });
+            }
+            TufCommand::Refresh { directory } => {
+                log::info!("refreshing TUF repository {}", directory.display());
+                tuf::refresh(&directory).await?;
+                pako_log::suspend_progress(|| {
+                    println!("refreshed TUF metadata: {}", directory.display());
                 });
             }
         },
