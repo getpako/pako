@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -112,7 +110,12 @@ impl Installer {
             &staging,
             manifest.artifact.archive().strip_components,
         )?;
-        apply_transforms(manifest, &staging)?;
+        if matches!(
+            manifest.artifact,
+            crate::manifest::Artifact::ExternalArchive { .. }
+        ) {
+            crate::transform::apply(&manifest.transforms, &staging)?;
+        }
         journal.advance(&self.layout, Phase::Materialized)?;
 
         log::debug!("verifying staged package tree");
@@ -388,88 +391,6 @@ impl Installer {
 
 fn package_version(manifest: &PackageManifest) -> String {
     format!("{}-{}", manifest.upstream_version, manifest.release)
-}
-
-fn apply_transforms(manifest: &PackageManifest, root: &Path) -> anyhow::Result<()> {
-    use crate::manifest::InstallTransform;
-    for transform in &manifest.transforms {
-        match transform {
-            InstallTransform::Remove { paths, required } => {
-                for path in paths {
-                    let target = path.join_to(root);
-                    if target.exists() || target.symlink_metadata().is_ok() {
-                        remove_transform_path(&target)?;
-                    } else if *required {
-                        anyhow::bail!("required transform path does not exist: {path}");
-                    }
-                }
-            }
-            InstallTransform::Chmod { path, mode } => {
-                let target = path.join_to(root);
-                if target.symlink_metadata()?.file_type().is_symlink() {
-                    anyhow::bail!("cannot chmod symlink: {path}");
-                }
-                std::fs::set_permissions(
-                    target,
-                    std::fs::Permissions::from_mode(u32::from(*mode)),
-                )?;
-            }
-            InstallTransform::Move { from, to } => {
-                let source = from.join_to(root);
-                let destination = to.join_to(root);
-                ensure_transform_parent(root, &destination)?;
-                std::fs::rename(source, destination)?;
-            }
-            InstallTransform::Copy { from, to } => {
-                let source = from.join_to(root);
-                let destination = to.join_to(root);
-                ensure_transform_parent(root, &destination)?;
-                std::fs::copy(source, destination)?;
-            }
-            InstallTransform::Write {
-                path,
-                mode,
-                content,
-            } => {
-                let target = path.join_to(root);
-                ensure_transform_parent(root, &target)?;
-                std::fs::write(&target, content)?;
-                std::fs::set_permissions(
-                    target,
-                    std::fs::Permissions::from_mode(u32::from(*mode)),
-                )?;
-            }
-            InstallTransform::Symlink { path, target } => {
-                let destination = path.join_to(root);
-                ensure_transform_parent(root, &destination)?;
-                crate::path::validate_symlink_target(path, target)?;
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(target, destination)?;
-                #[cfg(not(unix))]
-                anyhow::bail!("symlink transforms are unsupported on this platform");
-            }
-        }
-    }
-    Ok(())
-}
-fn ensure_transform_parent(root: &Path, path: &Path) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("transform path has no parent"))?;
-    if !parent.starts_with(root) {
-        anyhow::bail!("transform escaped staging");
-    }
-    std::fs::create_dir_all(parent)?;
-    Ok(())
-}
-fn remove_transform_path(path: &Path) -> anyhow::Result<()> {
-    let metadata = path.symlink_metadata()?;
-    if metadata.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
 }
 
 fn resolve_current_target(current: &Path) -> Option<PathBuf> {

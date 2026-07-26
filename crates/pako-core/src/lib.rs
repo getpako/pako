@@ -12,6 +12,7 @@ pub mod path;
 mod permissions;
 pub mod receipt;
 pub mod transaction;
+pub mod transform;
 pub mod verify;
 
 pub use digest::Sha256Digest;

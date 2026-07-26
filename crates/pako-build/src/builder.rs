@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    os::unix::fs::{symlink, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -311,93 +311,11 @@ fn apply_transforms<'a>(
     root: &Path,
     transforms: impl IntoIterator<Item = &'a Transform>,
 ) -> anyhow::Result<()> {
-    for transform in transforms {
-        match transform {
-            Transform::Remove { paths, required } => {
-                for path in paths {
-                    let path = payload_path(root, path)?;
-                    if !path_exists(&path) {
-                        if *required {
-                            anyhow::bail!("required path does not exist: {}", path.display());
-                        }
-                        continue;
-                    }
-                    remove_path(&path)?;
-                }
-            }
-            Transform::Chmod { path, mode } => {
-                let path = payload_path(root, path)?;
-                let permissions = parse_mode(mode)?;
-                let metadata = std::fs::symlink_metadata(&path)?;
-                if metadata.file_type().is_symlink() {
-                    anyhow::bail!("cannot change permissions of symlink: {}", path.display());
-                }
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(permissions))?;
-            }
-            Transform::Move { from, to } => {
-                let source = payload_path(root, from)?;
-                let destination = payload_path(root, to)?;
-                ensure_safe_parent(root, &source)?;
-                ensure_safe_parent(root, &destination)?;
-                if !path_exists(&source) {
-                    anyhow::bail!("move source does not exist: {}", source.display());
-                }
-                if path_exists(&destination) {
-                    anyhow::bail!("move destination already exists: {}", destination.display());
-                }
-                if let Some(parent) = destination.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::rename(source, destination)?;
-            }
-            Transform::Copy { from, to } => {
-                let source = payload_path(root, from)?;
-                let destination = payload_path(root, to)?;
-                ensure_safe_parent(root, &source)?;
-                ensure_safe_parent(root, &destination)?;
-                if !path_exists(&source) {
-                    anyhow::bail!("copy source does not exist: {}", source.display());
-                }
-                if path_exists(&destination) {
-                    anyhow::bail!("copy destination already exists: {}", destination.display());
-                }
-                if let Some(parent) = destination.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                copy_path(&source, &destination)?;
-            }
-            Transform::Write {
-                path,
-                mode,
-                content,
-            } => {
-                let path = payload_path(root, path)?;
-                ensure_safe_parent(root, &path)?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&path, content)?;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(parse_mode(mode)?))?;
-            }
-            Transform::Symlink { path, target } => {
-                let path = PackagePath::new(path.clone())?;
-                let destination = path.join_to(root);
-                ensure_safe_parent(root, &destination)?;
-                validate_symlink_target(&path, target)?;
-                if path_exists(&destination) {
-                    anyhow::bail!(
-                        "symlink destination already exists: {}",
-                        destination.display()
-                    );
-                }
-                if let Some(parent) = destination.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                symlink(target, destination)?;
-            }
-        }
-    }
-    Ok(())
+    let transforms = transforms
+        .into_iter()
+        .map(install_transform)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    pako_core::transform::apply(&transforms, root)
 }
 
 fn apply_assertions<'a>(
@@ -448,49 +366,6 @@ fn payload_path(root: &Path, value: &str) -> anyhow::Result<PathBuf> {
 
 fn path_exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
-}
-
-fn ensure_safe_parent(root: &Path, path: &Path) -> anyhow::Result<()> {
-    let relative = path.strip_prefix(root)?;
-    let mut current = root.to_owned();
-    for component in relative
-        .components()
-        .take(relative.components().count().saturating_sub(1))
-    {
-        current.push(component);
-        if std::fs::symlink_metadata(&current)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            anyhow::bail!("payload path traverses a symlink: {}", current.display());
-        }
-    }
-    Ok(())
-}
-
-fn remove_path(path: &Path) -> anyhow::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-fn copy_path(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    let metadata = std::fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink() {
-        symlink(std::fs::read_link(source)?, destination)?;
-    } else if metadata.is_dir() {
-        std::fs::create_dir(destination)?;
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            copy_path(&entry.path(), &destination.join(entry.file_name()))?;
-        }
-    } else {
-        std::fs::copy(source, destination)?;
-    }
-    Ok(())
 }
 
 fn parse_mode(value: &str) -> anyhow::Result<u32> {
