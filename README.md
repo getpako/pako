@@ -5,7 +5,9 @@ Pako is a user-space package manager for large, self-contained Linux application
 It installs applications without `sudo` and atomically switches the active
 version only after complete integrity verification.
 
-> Pako is under active development. The target for the first public release is `0.1.0`.
+> Pako is beta software (`v0.1.0-beta.1`). The manifest and recipe formats may
+> change before a stable release. Applications are not sandboxed at runtime.
+> External archives are downloaded in full for each install or upgrade.
 
 ## Architecture
 
