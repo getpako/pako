@@ -1173,7 +1173,6 @@ dependencies = [
  "log",
  "pako-core",
  "pako-log",
- "pako-oci",
  "reqwest 0.12.28",
  "ring",
  "serde",
@@ -1241,25 +1240,6 @@ dependencies = [
  "anyhow",
  "indicatif",
  "log",
-]
-
-[[package]]
-name = "pako-oci"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "bytes",
- "futures-util",
- "indicatif",
- "log",
- "pako-core",
- "reqwest 0.12.28",
- "serde",
- "sha2",
- "tokio",
- "url",
 ]
 
 [[package]]

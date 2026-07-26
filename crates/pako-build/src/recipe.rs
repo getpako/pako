@@ -288,7 +288,7 @@ fn validate_target(target: &Target) -> anyhow::Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("build scripts require an environment"))?;
         if !environment.contains("@sha256:") {
-            anyhow::bail!("build environment must be pinned by OCI digest");
+            anyhow::bail!("build environment must be pinned by image digest");
         }
     }
 

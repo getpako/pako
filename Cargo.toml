@@ -4,7 +4,6 @@ members = [
     "crates/pako-core",
     "crates/pako-cli",
     "crates/pako-build",
-    "crates/pako-oci",
     "crates/pako-trust",
     "crates/pako-test-support",
     "crates/pako-log",

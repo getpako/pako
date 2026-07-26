@@ -1,7 +1,7 @@
 //! Repository-local development automation.
 //!
 //! The xtask is intentionally a thin orchestration layer. It invokes the public
-//! `pako-build` and `pako` binaries instead of duplicating package, OCI, or TUF
+//! `pako-build` and `pako` binaries instead of duplicating package or TUF
 //! behavior inside developer tooling.
 
 mod context;
@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Manage the isolated local OCI, TUF, and Pako client environment.
+    /// Manage the isolated local TUF and Pako client environment.
     Dev {
         #[command(subcommand)]
         command: DevCommand,
@@ -37,7 +37,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum DevCommand {
-    /// Initialize local state when needed and start OCI and TUF services.
+    /// Initialize local state when needed and start the TUF service.
     Up,
 
     /// Stop local services without deleting their data.
@@ -46,7 +46,7 @@ pub(crate) enum DevCommand {
     /// Delete all local state and start a fresh environment.
     Reset,
 
-    /// Build and publish a recipe to the local OCI and TUF repositories.
+    /// Build and publish a recipe to the local TUF repository.
     Publish {
         /// Path to the recipe.toml file.
         recipe: PathBuf,

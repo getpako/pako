@@ -9,8 +9,8 @@ workflows:
 
 - [Using Pako](commands.md) — install, upgrade, verify, rollback, and remove packages.
 - [Building packages](recipe.md) — write and validate `recipe.toml` files.
-- [Publishing packages](publishing.md) — build artifacts, publish OCI data, and update TUF metadata.
-- [Local development](development.md) — run the registry, TUF server, and smoke test.
+- [Publishing packages](publishing.md) — build artifacts and update TUF metadata.
+- [Local development](development.md) — run the TUF server and smoke test.
 - [Security model](security.md) — trust boundaries, verification, and limitations.
 
 ## System shape
@@ -19,10 +19,9 @@ workflows:
 recipe.toml
     │
     ▼
-pako-build ──► package-manifest.json + payload.tar.zst
+pako-build ──► package-manifest.json + package.tar.zst (hosted only)
     │                         │
-    │                         ├── OCI registry (publication)
-    │                         └── TUF targets (trusted resolution)
+    │                         └── TUF targets (publication and trusted resolution)
     │
     ▼
 pako CLI ──► signed catalog ──► manifest ──► verified archive ──► atomic activation
@@ -39,8 +38,7 @@ archive by digest and size.
 | --- | --- |
 | `pako-core` | Package manifests, safe archive extraction, verification, transactions, XDG layout, integrations, and receipts. |
 | `pako-cli` | End-user commands, repository resolution, downloads, prompts, and output. |
-| `pako-build` | Recipe validation, source preparation, builds, archive creation, OCI publication, and TUF updates. |
-| `pako-oci` | OCI Distribution API client for manifests and blobs. |
+| `pako-build` | Recipe validation, source preparation, builds, archive creation, and TUF publication. |
 | `pako-trust` | Trusted TUF metadata loading and catalog resolution. |
 | `pako-log` | Shared logs and progress rendering. |
 | `pako-test-support` | Isolated layouts and deterministic test helpers. |

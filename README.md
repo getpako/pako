@@ -10,7 +10,7 @@ version only after complete integrity verification.
 ## Architecture
 
 A package release is represented by a canonical file-tree manifest and one
-SHA-256-addressed `payload.tar.zst` archive. Signed TUF metadata resolves a
+SHA-256-addressed archive or an upstream archive URL. Signed TUF metadata resolves a
 package release to its manifest and archive targets. Pako safely extracts the
 payload into a staging directory, verifies every declared entry and the final
 tree digest, then atomically activates the completed version.
@@ -23,7 +23,6 @@ recipes, publishing, development, architecture, and security.
 - `pako-core` — manifests, payload extraction, verification, transactions, integrations and receipts.
 - `pako-cli` — the end-user `pako` command.
 - `pako-build` — recipe parser, package builder and publisher.
-- `pako-oci` — OCI Distribution API client.
 - `pako-trust` — TUF-backed release resolution.
 - `pako-test-support` — deterministic fixtures and temporary XDG layouts.
 - `pako-log` — shared structured logging and coordinated progress rendering.

@@ -1,7 +1,7 @@
 # Local development
 
-The local development environment provides an OCI registry at `127.0.0.1:5000`,
-an HTTP TUF server at `127.0.0.1:8080`, isolated client state under `.dev/client`,
+The local development environment provides an HTTP TUF server at
+`127.0.0.1:8080`, isolated client state under `.dev/client`,
 and a generated trust root under `.dev/tuf`.
 
 Requirements are Rust/Cargo compatible with the workspace and Docker Compose,
@@ -30,7 +30,6 @@ cargo xtask dev reset
 ```
 
 `up` initializes missing TUF state and client configuration. `down` stops the
-services. `reset` removes `.dev`, removes the registry volume, and creates a
-new development trust root.
+service. `reset` removes `.dev` and creates a new development trust root.
 
 The local Compose definition and Nginx configuration live in [`dev/`](../dev/).

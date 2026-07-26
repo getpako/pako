@@ -31,7 +31,7 @@ Install a package from the configured Pako repository.
 
 Pako resolves the requested package, release channel, and host architecture
 using signed repository metadata. It then downloads the package manifest and
-its single `payload.tar.zst` archive.
+its verified upstream or TUF-hosted archive.
 
 The payload is extracted into a staging directory and the complete tree is
 verified before activation. Activation is atomic: an incomplete or invalid
@@ -203,7 +203,7 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "JOBS", global = true)]
     pub(crate) jobs: Option<NonZeroUsize>,
 
-    /// Maximum number of concurrent registry blob downloads.
+    /// Maximum number of concurrent artifact downloads.
     ///
     /// The default is the smaller of six and the selected CPU worker count.
     #[arg(long, value_name = "JOBS", global = true)]

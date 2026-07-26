@@ -1,6 +1,6 @@
 [package]
 name = "pako-build"
-description = "Recipe builder and OCI publisher for Pako"
+description = "Recipe builder and TUF publisher for Pako"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,7 +23,6 @@ jiff.workspace = true
 log.workspace = true
 pako-core = { path = "../pako-core" }
 pako-log = { path = "../pako-log" }
-pako-oci = { path = "../pako-oci" }
 reqwest.workspace = true
 ring.workspace = true
 serde.workspace = true

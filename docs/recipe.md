@@ -136,7 +136,7 @@ script = "build.sh"
 timeout = 7200
 ```
 
-The image must be pinned by OCI digest. Network access is disabled unless `network = true` is set.
+The image must be pinned by immutable digest. Network access is disabled unless `network = true` is set.
 The script runs with Bash inside the rootless build sandbox and must place the final payload under
 `$PAKO_DESTDIR`.
 
@@ -160,7 +160,7 @@ sources must remain inside the recipe directory.
 
 - Unknown fields are rejected, so misspelled configuration does not silently change behavior.
 - Remote downloads require SHA-256 pinning.
-- Build images require immutable OCI digests.
+- Build images require immutable digests.
 - Archive paths and symlinks are validated before extraction.
 - Recipe scripts run only in the build sandbox and are never included in the end-user package.
 - The generated package manifest remains the complete source of truth for installation and repair.

@@ -16,8 +16,6 @@ use walkdir::WalkDir;
 
 use crate::{context::Context, process, DevCommand};
 
-const REGISTRY_REFERENCE: &str = "localhost:5000/pako";
-const REGISTRY_ADDRESS: &str = "127.0.0.1:5000";
 const TUF_ADDRESS: &str = "127.0.0.1:8080";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -50,13 +48,10 @@ fn up(context: &Context) -> Result<()> {
     let compose = ComposeRuntime::detect()?;
     compose.up(context)?;
 
-    wait_for_http(REGISTRY_ADDRESS, "/v2/", STARTUP_TIMEOUT)
-        .context("local OCI registry did not become ready")?;
     wait_for_http(TUF_ADDRESS, "/metadata/root.json", STARTUP_TIMEOUT)
         .context("local TUF server did not become ready")?;
 
     println!("Pako development environment is ready");
-    println!("OCI: http://{REGISTRY_ADDRESS}");
     println!("TUF: http://{TUF_ADDRESS}");
     println!("State: {}", context.dev().display());
     Ok(())
@@ -272,25 +267,16 @@ fn publish_recipe(
         .context("package manifest has no parent directory")?;
     let manifest: ManifestSummary =
         serde_json::from_slice(&fs::read(&manifest_path)?).context("invalid package manifest")?;
-    let reference = format!(
-        "{REGISTRY_REFERENCE}/{}:dev-{}",
-        manifest.package,
-        target.replace('/', "-")
-    );
-
     process::run(
         Command::new(context.pako_build())
             .arg("publish")
             .arg(artifact)
-            .arg("--reference")
-            .arg(&reference)
-            .arg("--insecure-http")
             .arg("--tuf")
             .arg(context.tuf())
             .current_dir(context.root()),
     )?;
 
-    println!("Published {} to {reference}", manifest.package);
+    println!("Published {} to local TUF", manifest.package);
     Ok(PublishedPackage {
         package: manifest.package,
     })

@@ -16,7 +16,7 @@ pub const ARCHIVE_MEDIA_TYPE: &str = "application/vnd.pako.archive.v1";
 /// Complete, immutable description of one package release for one target.
 ///
 /// The manifest is the source of truth for installation and verification. It
-/// deliberately contains no registry URLs or mutable tags.
+/// deliberately contains no mutable tags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageManifest {

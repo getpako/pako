@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
 
 use tokio::{process::Command, time::timeout};
 
-/// Rootless OCI build sandbox used for source recipes.
+/// Rootless container build sandbox used for source recipes.
 #[derive(Debug, Clone)]
 pub(crate) struct Sandbox {
     pub image: String,
