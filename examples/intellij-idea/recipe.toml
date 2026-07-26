@@ -1,6 +1,6 @@
 schema = 1
 name = "intellij-idea"
-version = "2026.1"
+version = "2026.1-fixture"
 display_name = "IntelliJ IDEA"
 summary = "Integrated development environment for Java and Kotlin"
 description = "IntelliJ IDEA is an integrated development environment for JVM technologies."
@@ -21,16 +21,16 @@ categories = ["Development", "IDE"]
 
 [source.x86_64]
 distribution = "external"
-url = "http://127.0.0.1:8765/idea-linux-x86_64.tar.gz"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-size = 1
-format = "tar.gz"
+url = "http://127.0.0.1:8765/idea-linux-x86_64.tar"
+sha256 = "4db4b6b090816d1ebcbb35459a5aa9270b27dbc06310f8e78e56ddeb925d00b0"
+size = 10240
+format = "tar"
 strip = 1
 
 [source.aarch64]
 distribution = "external"
-url = "http://127.0.0.1:8765/idea-linux-aarch64.tar.gz"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-size = 1
-format = "tar.gz"
+url = "http://127.0.0.1:8765/idea-linux-aarch64.tar"
+sha256 = "4db4b6b090816d1ebcbb35459a5aa9270b27dbc06310f8e78e56ddeb925d00b0"
+size = 10240
+format = "tar"
 strip = 1

@@ -13,5 +13,6 @@ executables = ["bin/hello-pako"]
 hello-pako = "bin/hello-pako"
 
 [source.x86_64]
+distribution = "hosted"
 path = "payload/hello-pako"
 to = "bin/hello-pako"

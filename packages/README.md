@@ -4,8 +4,8 @@ The repository currently ships two development fixtures:
 
 - `examples/hello-local` is a working hosted-package fixture used by the
   offline smoke flow.
-- `examples/intellij-idea` is an external-archive schema fixture. Its loopback
-  URL, digest, and size are intentionally test values and must not be
+- `examples/intellij-idea` is a working external-archive fixture for x86_64 and
+  aarch64. Its loopback URL, digest, and size are intentionally test values and must not be
   published as a production package.
 
 Before adding a real package release, maintainers must record:
