@@ -10,8 +10,8 @@ use pako_core::Sha256Digest;
 
 use super::{OneOrMany, RawBuild, RawCommand, RawDesktop, RawRecipe, RawSource};
 use crate::recipe::{
-    Assertion, Build, DesktopEntry, Icon, Integrations, Launcher, Metadata, Package, Recipe,
-    Scripts, Source, Target, Transform,
+    Assertion, Build, DesktopEntry, Distribution, Icon, Integrations, Launcher, Metadata, Package,
+    Recipe, Scripts, Source, Target, Transform,
 };
 
 pub(super) fn recipe(raw: RawRecipe, directory: PathBuf) -> anyhow::Result<Recipe> {
@@ -112,10 +112,23 @@ fn normalize_targets(
             .transpose()?
             .unwrap_or_default();
 
+        let distribution = sources
+            .iter()
+            .find_map(|source| source.distribution)
+            .unwrap_or(Distribution::Hosted);
+        if sources
+            .iter()
+            .filter_map(|source| source.distribution)
+            .any(|value| value != distribution)
+        {
+            anyhow::bail!("target {platform} mixes distribution types");
+        }
+
         targets.push(Target {
             platform,
             build,
             sources,
+            distribution,
             transforms: Vec::new(),
             assertions: Vec::new(),
         });
@@ -148,12 +161,14 @@ fn normalize_target_name(value: &str) -> anyhow::Result<String> {
 
 fn normalize_source(raw: RawSource, directory: &Path) -> anyhow::Result<Source> {
     let RawSource {
+        distribution,
         path,
         url,
         mirrors,
         sha256,
         format,
         strip,
+        size,
         destination,
     } = raw;
 
@@ -196,11 +211,16 @@ fn normalize_source(raw: RawSource, directory: &Path) -> anyhow::Result<Source> 
     };
 
     Ok(Source {
+        distribution: distribution
+            .as_deref()
+            .map(Distribution::parse)
+            .transpose()?,
         path,
         urls,
         hash,
         format,
         strip_components: strip,
+        size,
         destination,
     })
 }

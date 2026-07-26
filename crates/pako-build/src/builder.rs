@@ -23,7 +23,7 @@ use walkdir::WalkDir;
 
 use crate::{
     archive,
-    recipe::{Assertion, Recipe, Target, Transform},
+    recipe::{Assertion, Distribution, Recipe, Target, Transform},
 };
 
 #[derive(Debug, Clone)]
@@ -32,7 +32,7 @@ pub(crate) struct BuildReport {
     pub version: String,
     pub target: String,
     pub package_manifest: PathBuf,
-    pub payload: PathBuf,
+    pub artifact: Option<PathBuf>,
     pub output: PathBuf,
 }
 #[derive(Debug)]
@@ -187,6 +187,7 @@ impl Builder {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_lines)]
     fn package(
         &self,
         recipe: &Recipe,
@@ -205,9 +206,66 @@ impl Builder {
         std::fs::create_dir_all(&output)?;
         let mut entries = scan_tree(root)?;
         entries.sort_by(|left, right| left.path().cmp(right.path()));
-        let payload_path = output.join("payload.tar.zst");
-        create_payload(root, &payload_path)?;
-        let (digest, size) = Sha256Digest::calculate_reader(File::open(&payload_path)?)?;
+        let transforms = recipe
+            .transforms
+            .iter()
+            .chain(target.transforms.iter())
+            .map(install_transform)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let (artifact, artifact_path) = match target.distribution {
+            Distribution::External => {
+                let source = target
+                    .sources
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("external target has no source"))?;
+                let urls = source
+                    .urls
+                    .iter()
+                    .map(|url| url.parse())
+                    .collect::<Result<Vec<url::Url>, _>>()?;
+                let format = source
+                    .format
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("external source has no archive format"))?
+                    .parse()?;
+                (
+                    Artifact::ExternalArchive {
+                        urls,
+                        digest: source.hash.parse()?,
+                        size: source.size.ok_or_else(|| {
+                            anyhow::anyhow!("external source has no archive size")
+                        })?,
+                        archive: ArchiveDescriptor {
+                            format,
+                            strip_components: source.strip_components,
+                        },
+                    },
+                    None,
+                )
+            }
+            Distribution::Hosted => {
+                let archive_path = output.join("package.tar.zst");
+                create_payload(root, &archive_path)?;
+                let (digest, size) = Sha256Digest::calculate_reader(File::open(&archive_path)?)?;
+                (
+                    Artifact::TufArchive {
+                        target: format!(
+                            "artifacts/{}/{}/{}.tar.zst",
+                            recipe.package.name,
+                            version,
+                            target.platform.replace('/', "-")
+                        ),
+                        digest,
+                        size,
+                        archive: ArchiveDescriptor {
+                            format: ArchiveFormat::TarZst,
+                            strip_components: 0,
+                        },
+                    },
+                    Some(archive_path),
+                )
+            }
+        };
         let manifest = PackageManifest {
             schema_version: 1,
             media_type: PACKAGE_MANIFEST_MEDIA_TYPE.into(),
@@ -223,28 +281,14 @@ impl Builder {
                 homepage: recipe.metadata.homepage.clone(),
                 license: recipe.metadata.license.clone(),
             },
-            artifact: Artifact::TufArchive {
-                target: format!(
-                    "artifacts/{}/{}/{}.tar.zst",
-                    recipe.package.name,
-                    version,
-                    target.platform.replace('/', "-")
-                ),
-                digest,
-                size,
-                archive: ArchiveDescriptor {
-                    format: ArchiveFormat::TarZst,
-                    strip_components: 0,
-                },
-            },
+            artifact,
             tree_digest: compute_tree_digest(&entries),
             entries,
-            transforms: recipe
-                .transforms
-                .iter()
-                .chain(target.transforms.iter())
-                .map(install_transform)
-                .collect::<anyhow::Result<_>>()?,
+            transforms: if target.distribution == Distribution::External {
+                transforms
+            } else {
+                Vec::new()
+            },
             integrations: integrations(recipe)?,
             policies: Policies {
                 artifact_mutation: "deny".into(),
@@ -260,7 +304,7 @@ impl Builder {
             version,
             target: target.platform.clone(),
             package_manifest: manifest_path,
-            payload: payload_path,
+            artifact: artifact_path,
             output,
         })
     }

@@ -53,6 +53,7 @@ pub(crate) struct Target {
     #[serde(default)]
     pub build: Build,
     pub sources: Vec<Source>,
+    pub distribution: Distribution,
     #[serde(default)]
     pub transforms: Vec<Transform>,
     #[serde(default)]
@@ -103,17 +104,36 @@ impl Scripts {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Source {
+    pub distribution: Option<Distribution>,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub urls: Vec<String>,
     pub hash: String,
+    pub size: Option<u64>,
     #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]
     pub strip_components: u32,
     #[serde(default)]
     pub destination: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Distribution {
+    External,
+    Hosted,
+}
+
+impl Distribution {
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "external" => Ok(Self::External),
+            "hosted" => Ok(Self::Hosted),
+            other => anyhow::bail!("unsupported distribution {other}; use external or hosted"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -272,6 +292,28 @@ fn validate_target(target: &Target) -> anyhow::Result<()> {
         }
     }
 
+    match target.distribution {
+        Distribution::External => {
+            if target.sources.len() != 1 {
+                anyhow::bail!("external targets require exactly one archive source");
+            }
+            let source = &target.sources[0];
+            if source.path.is_some() || source.urls.is_empty() {
+                anyhow::bail!("external targets require remote archive URLs");
+            }
+            if !target.build.scripts.is_empty() {
+                anyhow::bail!("external targets cannot define build scripts");
+            }
+            if source.format.is_none() {
+                anyhow::bail!("external targets require an archive format");
+            }
+            if source.size.unwrap_or(0) == 0 {
+                anyhow::bail!("external targets require a positive archive size");
+            }
+        }
+        Distribution::Hosted => {}
+    }
+
     for source in &target.sources {
         validate_source(source)?;
     }
@@ -295,6 +337,10 @@ fn validate_source(source: &Source) -> anyhow::Result<()> {
 
     if source.path.is_some() != source.urls.is_empty() {
         anyhow::bail!("source must define exactly one of path or urls");
+    }
+
+    if source.size == Some(0) {
+        anyhow::bail!("source size must be positive");
     }
 
     if source.format.is_none() {

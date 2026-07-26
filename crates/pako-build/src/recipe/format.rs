@@ -81,6 +81,8 @@ impl<T> OneOrMany<T> {
 #[serde(deny_unknown_fields)]
 struct RawSource {
     #[serde(default)]
+    distribution: Option<String>,
+    #[serde(default)]
     path: Option<String>,
     #[serde(default)]
     url: Option<String>,
@@ -92,6 +94,8 @@ struct RawSource {
     format: Option<String>,
     #[serde(default)]
     strip: u32,
+    #[serde(default)]
+    size: Option<u64>,
     #[serde(default, rename = "to")]
     destination: Option<String>,
 }

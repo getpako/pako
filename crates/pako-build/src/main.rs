@@ -300,7 +300,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 );
                 println!("output: {}", report.output.display());
                 println!("manifest: {}", report.package_manifest.display());
-                println!("payload: {}", report.payload.display());
+                if let Some(artifact) = report.artifact {
+                    println!("artifact: {}", artifact.display());
+                } else {
+                    println!("artifact: external archive referenced by manifest");
+                }
             });
         }
         Command::Publish(arguments) => {

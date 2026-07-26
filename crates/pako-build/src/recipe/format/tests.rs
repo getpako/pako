@@ -3,7 +3,7 @@ use std::fs;
 use tempfile::TempDir;
 
 use super::load;
-use crate::recipe::{Assertion, Transform};
+use crate::recipe::{Assertion, Distribution, Transform};
 
 #[test]
 fn normalizes_a_minimal_local_recipe() {
@@ -51,6 +51,65 @@ to = "bin/hello"
         Assertion::Path { path, executable: true, .. } if path == "bin/hello"
     )));
     assert_eq!(recipe.integrations.launchers[0].name, "hello");
+    assert_eq!(recipe.targets[0].distribution, Distribution::Hosted);
+}
+
+#[test]
+fn validates_external_distribution_requirements_and_mirrors() {
+    let fixture = TempDir::new().unwrap();
+    fs::write(
+        fixture.path().join("recipe.toml"),
+        r#"
+schema = 1
+name = "editor"
+version = "2.0.0"
+summary = "Editor"
+license = "MIT"
+
+[source.x86_64]
+distribution = "external"
+url = "https://vendor.example/editor.tar.gz"
+mirrors = ["https://mirror.example/editor.tar.gz"]
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size = 42
+format = "tar.gz"
+strip = 1
+"#,
+    )
+    .unwrap();
+
+    let recipe = load(&fixture.path().join("recipe.toml")).unwrap();
+    recipe.validate().unwrap();
+    assert_eq!(recipe.targets[0].distribution, Distribution::External);
+    assert_eq!(recipe.targets[0].sources[0].urls.len(), 2);
+    assert_eq!(recipe.targets[0].sources[0].size, Some(42));
+}
+
+#[test]
+fn rejects_external_distribution_without_size_or_with_local_path() {
+    for source in [
+        r#"distribution = "external"
+path = "payload/app"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+format = "tar.gz"
+size = 42"#,
+        r#"distribution = "external"
+url = "https://vendor.example/app.tar.gz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+format = "tar.gz""#,
+    ] {
+        let fixture = TempDir::new().unwrap();
+        fs::write(
+            fixture.path().join("recipe.toml"),
+            format!(
+                "schema = 1\nname = \"app\"\nversion = \"1\"\nsummary = \"App\"\nlicense = \"MIT\"\n\n[source.x86_64]\n{source}\n"
+            ),
+        )
+        .unwrap();
+        assert!(load(&fixture.path().join("recipe.toml"))
+            .and_then(|recipe| recipe.validate())
+            .is_err());
+    }
 }
 
 #[test]
