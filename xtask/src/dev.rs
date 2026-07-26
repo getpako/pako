@@ -267,6 +267,19 @@ fn publish_recipe(
         .context("package manifest has no parent directory")?;
     let manifest: ManifestSummary =
         serde_json::from_slice(&fs::read(&manifest_path)?).context("invalid package manifest")?;
+    match manifest.artifact.kind.as_str() {
+        "tuf-archive" => {
+            if !artifact.join("package.tar.zst").is_file() {
+                anyhow::bail!("hosted build did not produce package.tar.zst");
+            }
+        }
+        "external-archive" => {
+            if artifact.join("package.tar.zst").exists() {
+                anyhow::bail!("external build must not produce package.tar.zst");
+            }
+        }
+        other => anyhow::bail!("unsupported artifact type in manifest: {other:?}"),
+    }
     process::run(
         Command::new(context.pako_build())
             .arg("publish")
@@ -405,6 +418,13 @@ struct RepositoryConfig<'a> {
 #[derive(Debug, Deserialize)]
 struct ManifestSummary {
     package: String,
+    artifact: ManifestArtifact,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestArtifact {
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 #[derive(Debug)]
