@@ -13,10 +13,13 @@ Podman Compose, or the legacy `docker-compose` command.
 cargo xtask dev smoke
 ```
 
-The smoke command recreates the isolated environment, builds the local example,
-publishes it, installs it, verifies it, runs its launcher, and checks status.
-Because it resets `.dev` and the Compose volume, it is intentionally a clean
-integration test rather than a preservation workflow.
+The smoke command recreates the isolated environment and runs two complete
+local lifecycle scenarios. The hosted scenario covers two versions, install,
+upgrade, verify, rollback, prune, remove, and preservation of all TUF targets.
+The external scenario serves the checked-in tar archive from a local HTTP
+server, exercises mirror fallback and the artifact cache, applies transforms,
+and covers install, upgrade, verify, rollback, and remove. No JetBrains
+download or public internet access is required.
 
 ## Individual commands
 

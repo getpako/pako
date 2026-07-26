@@ -2,10 +2,11 @@ use std::{
     ffi::OsStr,
     fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{self, Sender, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +18,7 @@ use walkdir::WalkDir;
 use crate::{context::Context, process, DevCommand};
 
 const TUF_ADDRESS: &str = "127.0.0.1:8080";
+const ARCHIVE_ADDRESS: &str = "127.0.0.1:8765";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(crate) fn run(context: &Context, command: DevCommand) -> Result<()> {
@@ -92,6 +94,7 @@ fn make_removable(root: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn smoke(context: &Context) -> Result<()> {
     // Smoke tests must not reuse package or TUF state from a previous
     // development run. In particular, the catalog format can change between
@@ -99,22 +102,243 @@ fn smoke(context: &Context) -> Result<()> {
     reset(context)?;
     reset_client(context)?;
 
-    let recipe = context.root().join("examples/hello-local/recipe.toml");
-    let published = publish_recipe(context, &recipe, None)?;
+    let hosted_v1 = context.root().join("examples/hello-local/recipe.toml");
+    let hosted_v2 = write_hosted_v2_recipe(context, &hosted_v1)?;
+    let published = publish_recipe(context, &hosted_v1, None)?;
 
     run_pako(
         context,
         &["-y".into(), "install".into(), published.package.clone()],
     )?;
-    run_pako(context, &["verify".into(), published.package.clone()])?;
+    verify_pako(context, &published.package)?;
+    assert_active_version(context, &published.package, "1.0.0-3")?;
 
     let launcher = context.client().join("home/.local/bin/hello-pako");
     process::run(Command::new(&launcher).current_dir(context.root()))
         .context("installed hello-local launcher failed")?;
 
-    run_pako(context, &["status".into(), published.package])?;
-    println!("Pako development smoke test completed successfully");
+    publish_recipe(context, &hosted_v2, None)?;
+    run_pako(
+        context,
+        &["-y".into(), "upgrade".into(), published.package.clone()],
+    )?;
+    verify_pako(context, &published.package)?;
+    assert_active_version(context, &published.package, "2.0.0-3")?;
+    assert_tuf_targets(
+        context,
+        &[
+            "manifests/hello-local/1.0.0-3/linux-x86_64.json",
+            "manifests/hello-local/2.0.0-3/linux-x86_64.json",
+            "artifacts/hello-local/1.0.0-3/linux-x86_64.tar.zst",
+            "artifacts/hello-local/2.0.0-3/linux-x86_64.tar.zst",
+        ],
+    )?;
+
+    run_pako(
+        context,
+        &["-y".into(), "rollback".into(), published.package.clone()],
+    )?;
+    run_pako(context, &["verify".into(), published.package.clone()])?;
+    assert_active_version(context, &published.package, "1.0.0-3")?;
+    run_pako(
+        context,
+        &[
+            "-y".into(),
+            "prune".into(),
+            published.package.clone(),
+            "--keep".into(),
+            "1".into(),
+        ],
+    )?;
+    if context
+        .client()
+        .join("data/pako/cellar/hello-local/2.0.0-3")
+        .exists()
+    {
+        anyhow::bail!("hosted prune retained the removed version");
+    }
+    run_pako(
+        context,
+        &["-y".into(), "remove".into(), published.package.clone()],
+    )?;
+    assert_package_removed(context, &published.package)?;
+    assert_path_absent(&context.client().join("home/.local/bin/hello-pako"))?;
+
+    let archive = context
+        .root()
+        .join("examples/intellij-idea/idea-linux-x86_64.tar");
+    let _archive_server = ArchiveServer::start(archive)?;
+    let external_v1 = write_external_recipe(context, "2026.1-fixture")?;
+    let external = publish_recipe(context, &external_v1, None)?;
+    run_pako(
+        context,
+        &["-y".into(), "install".into(), external.package.clone()],
+    )?;
+    verify_pako(context, &external.package)?;
+    assert_active_version(context, &external.package, "2026.1-fixture-1")?;
+    assert_external_transform(context, "2026.1-fixture-1")?;
+    let cache_files = count_files(&context.client().join("cache/pako/artifacts/sha256"));
+
+    let external_v2 = write_external_recipe(context, "2026.2-fixture")?;
+    publish_recipe(context, &external_v2, None)?;
+    run_pako(
+        context,
+        &["-y".into(), "upgrade".into(), external.package.clone()],
+    )?;
+    verify_pako(context, &external.package)?;
+    assert_active_version(context, &external.package, "2026.2-fixture-1")?;
+    assert_external_transform(context, "2026.2-fixture-1")?;
+    if count_files(&context.client().join("cache/pako/artifacts/sha256")) != cache_files {
+        anyhow::bail!("external upgrade did not reuse the artifact cache");
+    }
+    run_pako(
+        context,
+        &["-y".into(), "rollback".into(), external.package.clone()],
+    )?;
+    verify_pako(context, &external.package)?;
+    assert_active_version(context, &external.package, "2026.1-fixture-1")?;
+    assert_external_transform(context, "2026.1-fixture-1")?;
+    run_pako(
+        context,
+        &["-y".into(), "remove".into(), external.package.clone()],
+    )?;
+    assert_package_removed(context, &external.package)?;
+    assert_path_absent(&context.client().join("home/.local/bin/intellij-idea"))?;
+    assert_path_absent(
+        &context
+            .client()
+            .join("data/pako/applications/pako-intellij-idea.desktop"),
+    )?;
+    assert_tuf_targets(
+        context,
+        &[
+            "manifests/hello-local/1.0.0-3/linux-x86_64.json",
+            "manifests/hello-local/2.0.0-3/linux-x86_64.json",
+            "artifacts/hello-local/1.0.0-3/linux-x86_64.tar.zst",
+            "artifacts/hello-local/2.0.0-3/linux-x86_64.tar.zst",
+            "manifests/intellij-idea/2026.1-fixture-1/linux-x86_64.json",
+            "manifests/intellij-idea/2026.2-fixture-1/linux-x86_64.json",
+        ],
+    )?;
+
+    run_pako(context, &["status".into()])?;
+    println!("Pako development lifecycle smoke tests completed successfully");
     Ok(())
+}
+
+fn write_hosted_v2_recipe(context: &Context, source: &Path) -> Result<PathBuf> {
+    let payload = source
+        .parent()
+        .context("hosted recipe has no parent")?
+        .join("payload/hello-pako")
+        .canonicalize()?;
+    let smoke_directory = context.build().join("smoke-recipes");
+    fs::create_dir_all(smoke_directory.join("payload"))?;
+    fs::copy(&payload, smoke_directory.join("payload/hello-pako"))?;
+    let recipe = fs::read_to_string(source)?.replace("version = \"1.0.0\"", "version = \"2.0.0\"");
+    write_smoke_recipe(context, "hello-local-v2.toml", recipe)
+}
+
+fn write_external_recipe(context: &Context, version: &str) -> Result<PathBuf> {
+    let mut recipe = fs::read_to_string(context.root().join("examples/intellij-idea/recipe.toml"))?
+        .replace(
+            "version = \"2026.1-fixture\"",
+            &format!("version = \"{version}\""),
+        );
+    for platform in ["x86_64", "aarch64"] {
+        let original = format!("url = \"http://127.0.0.1:8765/idea-linux-{platform}.tar\"");
+        let fallback = format!(
+            "url = \"http://127.0.0.1:8765/missing-{platform}.tar\"\nmirrors = [\"http://127.0.0.1:8765/idea-linux-{platform}.tar\"]"
+        );
+        recipe = recipe.replace(&original, &fallback);
+    }
+    write_smoke_recipe(context, &format!("intellij-idea-{version}.toml"), recipe)
+}
+
+fn write_smoke_recipe(context: &Context, name: &str, recipe: String) -> Result<PathBuf> {
+    let directory = context.build().join("smoke-recipes");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(name);
+    fs::write(&path, recipe)?;
+    Ok(path)
+}
+
+fn assert_active_version(context: &Context, package: &str, expected: &str) -> Result<()> {
+    let state = context
+        .client()
+        .join(format!("state/pako/packages/{package}.json"));
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&state)?)?;
+    let actual = value["active"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("package state has no active version"))?;
+    if actual != expected {
+        anyhow::bail!("expected {package} {expected}, found {actual}");
+    }
+    Ok(())
+}
+
+fn assert_package_removed(context: &Context, package: &str) -> Result<()> {
+    let root = context.client().join("data/pako");
+    let state = context
+        .client()
+        .join(format!("state/pako/packages/{package}.json"));
+    for path in [
+        state,
+        root.join(format!("cellar/{package}")),
+        root.join(format!("apps/{package}/current")),
+        root.join(format!("manifests/{package}")),
+    ] {
+        if path.exists() {
+            anyhow::bail!("remove left package state at {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn assert_path_absent(path: &Path) -> Result<()> {
+    if path.exists() {
+        anyhow::bail!("remove left path {}", path.display());
+    }
+    Ok(())
+}
+
+fn assert_external_transform(context: &Context, version: &str) -> Result<()> {
+    let path = context.client().join(format!(
+        "data/pako/cellar/intellij-idea/{version}/Install-Linux-tar.txt"
+    ));
+    if path.exists() {
+        anyhow::bail!(
+            "external remove transform did not remove {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn assert_tuf_targets(context: &Context, expected: &[&str]) -> Result<()> {
+    let metadata = context.tuf().join("metadata/targets.json");
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(metadata)?)?;
+    let targets = value["signed"]["targets"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("TUF targets metadata is not a map"))?;
+    for target in expected {
+        if !targets.contains_key(*target) {
+            anyhow::bail!("TUF targets metadata lost {target}");
+        }
+    }
+    Ok(())
+}
+
+fn count_files(directory: &Path) -> usize {
+    if !directory.exists() {
+        return 0;
+    }
+    WalkDir::new(directory)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .count()
 }
 
 fn build_tools(context: &Context) -> Result<()> {
@@ -309,6 +533,18 @@ fn run_pako(context: &Context, arguments: &[String]) -> Result<()> {
     process::run(&mut command)
 }
 
+fn verify_pako(context: &Context, package: &str) -> Result<()> {
+    let arguments = ["verify".into(), package.to_owned()];
+    match run_pako(context, &arguments) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            thread::sleep(Duration::from_millis(100));
+            run_pako(context, &arguments)
+                .with_context(|| format!("verify failed twice; first failure was: {first_error:#}"))
+        }
+    }
+}
+
 fn find_single_file(root: &Path, name: &str) -> Result<PathBuf> {
     let mut matches = Vec::new();
     collect_files(root, name, &mut matches)?;
@@ -430,6 +666,74 @@ struct ManifestArtifact {
 #[derive(Debug)]
 struct PublishedPackage {
     package: String,
+}
+
+struct ArchiveServer {
+    stop: Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ArchiveServer {
+    fn start(archive: PathBuf) -> Result<Self> {
+        let listener = TcpListener::bind(ARCHIVE_ADDRESS)
+            .with_context(|| format!("failed to bind local archive server at {ARCHIVE_ADDRESS}"))?;
+        listener.set_nonblocking(true)?;
+        let (stop, receiver) = mpsc::channel();
+        let thread = thread::spawn(move || loop {
+            match receiver.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = serve_archive_request(&mut stream, &archive);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        });
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for ArchiveServer {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_archive_request(stream: &mut TcpStream, archive: &Path) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let mut request = [0_u8; 4096];
+    let count = stream.read(&mut request)?;
+    let request = String::from_utf8_lossy(&request[..count]);
+    let path = request.split_whitespace().nth(1).unwrap_or_default();
+    if path.starts_with("/idea-linux-")
+        && Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension == "tar")
+    {
+        let bytes = fs::read(archive)?;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        )?;
+        stream.write_all(&bytes)?;
+    } else {
+        stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

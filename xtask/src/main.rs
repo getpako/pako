@@ -63,7 +63,7 @@ pub(crate) enum DevCommand {
         arguments: Vec<String>,
     },
 
-    /// Run build, publish, install, verify, launcher, and status checks.
+    /// Run hosted and external package lifecycle checks against local services.
     Smoke,
 }
 
