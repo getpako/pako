@@ -247,7 +247,7 @@ impl Builder {
                 .collect::<anyhow::Result<_>>()?,
             integrations: integrations(recipe)?,
             policies: Policies {
-                payload_mutation: "deny".into(),
+                artifact_mutation: "deny".into(),
                 self_update: "external".into(),
                 user_data: "external".into(),
             },

@@ -133,6 +133,8 @@ impl Artifact {
 
 impl ArchiveDescriptor {
     pub fn validate(&self) -> Result<()> {
+        let _ = usize::try_from(self.strip_components)
+            .map_err(|_| Error::InvalidManifest("stripComponents does not fit in usize".into()))?;
         Ok(())
     }
 }
@@ -244,7 +246,7 @@ pub struct Icon {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Policies {
-    pub payload_mutation: String,
+    pub artifact_mutation: String,
     pub self_update: String,
     pub user_data: String,
 }
@@ -254,6 +256,7 @@ impl PackageManifest {
     pub fn validate(&self) -> Result<()> {
         self.validate_header()?;
         self.validate_entries()?;
+        self.validate_transforms()?;
         self.validate_integrations()?;
         Ok(())
     }
@@ -279,6 +282,7 @@ impl PackageManifest {
                 "artifact size must be positive".into(),
             ));
         }
+        self.artifact.archive().validate()?;
         match &self.artifact {
             Artifact::ExternalArchive { urls, .. } => {
                 if urls.is_empty() {
@@ -287,10 +291,20 @@ impl PackageManifest {
                     ));
                 }
                 for url in urls {
+                    if !url.username().is_empty() || url.password().is_some() {
+                        return Err(Error::InvalidManifest(
+                            "artifact URL must not contain credentials".into(),
+                        ));
+                    }
+                    if url.fragment().is_some() {
+                        return Err(Error::InvalidManifest(
+                            "artifact URL must not contain a fragment".into(),
+                        ));
+                    }
                     if url.scheme() != "https"
                         && !(url.scheme() == "http"
                             && url.host_str().is_some_and(|host| {
-                                matches!(host, "localhost" | "127.0.0.1" | "::1")
+                                matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
                             }))
                     {
                         return Err(Error::InvalidManifest(format!(
@@ -302,11 +316,18 @@ impl PackageManifest {
             Artifact::TufArchive { target, .. } => {
                 if target.is_empty()
                     || target.starts_with('/')
+                    || target.contains('\\')
+                    || target.contains('\0')
                     || target
                         .split('/')
                         .any(|part| part.is_empty() || part == "." || part == "..")
                 {
                     return Err(Error::InvalidManifest("unsafe TUF artifact target".into()));
+                }
+                if !self.transforms.is_empty() {
+                    return Err(Error::InvalidManifest(
+                        "tuf archives must not define install transforms".into(),
+                    ));
                 }
             }
         }
@@ -342,6 +363,60 @@ impl PackageManifest {
         }
 
         self.validate_parent_directories(&paths)
+    }
+
+    fn validate_transforms(&self) -> Result<()> {
+        let mut created = BTreeSet::new();
+        for transform in &self.transforms {
+            match transform {
+                InstallTransform::Remove { paths, .. } => {
+                    if paths.is_empty() {
+                        return Err(Error::InvalidManifest(
+                            "remove transform requires at least one path".into(),
+                        ));
+                    }
+                    let mut seen = BTreeSet::new();
+                    for path in paths {
+                        if !seen.insert(path) {
+                            return Err(Error::InvalidManifest(
+                                "duplicate path in remove transform".into(),
+                            ));
+                        }
+                    }
+                }
+                InstallTransform::Chmod { mode, .. } => validate_mode(*mode)?,
+                InstallTransform::Move { from, to } => {
+                    if from == to {
+                        return Err(Error::InvalidManifest(
+                            "move source and destination must differ".into(),
+                        ));
+                    }
+                    insert_created(&mut created, to)?;
+                }
+                InstallTransform::Copy { from, to } => {
+                    if from == to {
+                        return Err(Error::InvalidManifest(
+                            "copy source and destination must differ".into(),
+                        ));
+                    }
+                    insert_created(&mut created, to)?;
+                }
+                InstallTransform::Write {
+                    path,
+                    mode,
+                    content,
+                } => {
+                    validate_mode(*mode)?;
+                    validate_single_line(content, "write content")?;
+                    insert_created(&mut created, path)?;
+                }
+                InstallTransform::Symlink { path, target } => {
+                    validate_symlink_target(path, target)?;
+                    insert_created(&mut created, path)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_entry_content(entry: &Entry) -> Result<()> {
@@ -436,10 +511,23 @@ fn validate_entry_mode(entry: &Entry) -> Result<()> {
         Entry::Symlink { .. } => None,
     };
 
-    if mode.is_some_and(|value| value & !0o777 != 0) {
-        return Err(Error::InvalidManifest("forbidden mode bits".into()));
-    }
+    mode.map_or(Ok(()), validate_mode)
+}
 
+fn validate_mode(mode: u16) -> Result<()> {
+    if mode & !0o777 != 0 {
+        Err(Error::InvalidManifest("forbidden mode bits".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn insert_created(created: &mut BTreeSet<PackagePath>, path: &PackagePath) -> Result<()> {
+    if !created.insert(path.clone()) {
+        return Err(Error::InvalidManifest(format!(
+            "multiple transforms create the same path: {path}"
+        )));
+    }
     Ok(())
 }
 
@@ -497,7 +585,7 @@ mod tests {
             transforms: vec![],
             integrations: Integrations::default(),
             policies: Policies {
-                payload_mutation: "deny".into(),
+                artifact_mutation: "deny".into(),
                 self_update: "external".into(),
                 user_data: "external".into(),
             },
@@ -550,5 +638,142 @@ mod tests {
             },
         };
         assert!(base(artifact).validate().is_err());
+    }
+
+    #[test]
+    fn accepts_loopback_http_but_rejects_credentials_and_fragments() {
+        for value in [
+            "http://localhost/demo.tar.gz",
+            "http://127.0.0.1/demo.tar.gz",
+            "http://[::1]/demo.tar.gz",
+        ] {
+            let artifact = Artifact::ExternalArchive {
+                urls: vec![value.parse().unwrap()],
+                digest: Sha256Digest::EMPTY,
+                size: 1,
+                archive: ArchiveDescriptor {
+                    format: ArchiveFormat::TarGz,
+                    strip_components: 0,
+                },
+            };
+            assert!(base(artifact).validate().is_ok(), "{value}");
+        }
+        for value in [
+            "https://user:password@example.com/demo.tar.gz",
+            "https://example.com/demo.tar.gz#fragment",
+        ] {
+            let artifact = Artifact::ExternalArchive {
+                urls: vec![value.parse().unwrap()],
+                digest: Sha256Digest::EMPTY,
+                size: 1,
+                archive: ArchiveDescriptor {
+                    format: ArchiveFormat::TarGz,
+                    strip_components: 0,
+                },
+            };
+            assert!(base(artifact).validate().is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_artifact_size_and_tuf_target_syntax() {
+        let artifact = Artifact::ExternalArchive {
+            urls: vec!["https://example.com/demo.tar.gz".parse().unwrap()],
+            digest: Sha256Digest::EMPTY,
+            size: 0,
+            archive: ArchiveDescriptor {
+                format: ArchiveFormat::TarGz,
+                strip_components: 0,
+            },
+        };
+        assert!(base(artifact).validate().is_err());
+
+        for target in ["a\\b", "a//b", "a/./b", "a/../b", "/a"] {
+            let artifact = Artifact::TufArchive {
+                target: target.into(),
+                digest: Sha256Digest::EMPTY,
+                size: 1,
+                archive: ArchiveDescriptor {
+                    format: ArchiveFormat::TarZst,
+                    strip_components: 0,
+                },
+            };
+            assert!(base(artifact).validate().is_err(), "{target}");
+        }
+    }
+
+    #[test]
+    fn validates_transform_conflicts_modes_symlinks_and_empty_removes() {
+        let external = || Artifact::ExternalArchive {
+            urls: vec!["https://example.com/demo.tar.gz".parse().unwrap()],
+            digest: Sha256Digest::EMPTY,
+            size: 1,
+            archive: ArchiveDescriptor {
+                format: ArchiveFormat::TarGz,
+                strip_components: 0,
+            },
+        };
+
+        let mut manifest = base(external());
+        manifest.transforms = vec![InstallTransform::Move {
+            from: PackagePath::new("a").unwrap(),
+            to: PackagePath::new("a").unwrap(),
+        }];
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = base(external());
+        manifest.transforms = vec![InstallTransform::Remove {
+            paths: vec![],
+            required: false,
+        }];
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = base(external());
+        manifest.transforms = vec![InstallTransform::Write {
+            path: PackagePath::new("a").unwrap(),
+            mode: 0o1000,
+            content: "ok".into(),
+        }];
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = base(external());
+        manifest.transforms = vec![InstallTransform::Symlink {
+            path: PackagePath::new("bin/app").unwrap(),
+            target: "../../outside".into(),
+        }];
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = base(external());
+        manifest.transforms = vec![
+            InstallTransform::Write {
+                path: PackagePath::new("a").unwrap(),
+                mode: 0o644,
+                content: "one".into(),
+            },
+            InstallTransform::Symlink {
+                path: PackagePath::new("a").unwrap(),
+                target: "b".into(),
+            },
+        ];
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_transforms_on_tuf_archives() {
+        let artifact = Artifact::TufArchive {
+            target: "artifacts/demo.tar.zst".into(),
+            digest: Sha256Digest::EMPTY,
+            size: 1,
+            archive: ArchiveDescriptor {
+                format: ArchiveFormat::TarZst,
+                strip_components: 0,
+            },
+        };
+        let mut manifest = base(artifact);
+        manifest.transforms = vec![InstallTransform::Remove {
+            paths: vec![PackagePath::new("old").unwrap()],
+            required: false,
+        }];
+        assert!(manifest.validate().is_err());
     }
 }
