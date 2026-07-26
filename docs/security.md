@@ -10,6 +10,11 @@ of them succeed:
 5. Every extracted entry is compared with the manifest.
 6. The complete verified tree is checked against its tree digest before activation.
 
+External archive URLs must use HTTPS; HTTP is accepted only for loopback test
+fixtures. Credentials and URL fragments are rejected. The artifact cache is
+keyed by SHA-256, checks size and digest on every hit, uses a per-digest lock,
+and never treats partial files as cache entries.
+
 ## Trust boundaries
 
 Recipe files and build scripts are maintainer-side inputs. They are never sent

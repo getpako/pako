@@ -32,6 +32,36 @@ TUF catalog resolves a package, channel, and target to the manifest target. The
 manifest then identifies either a TUF-hosted archive or an HTTPS external
 archive by digest and size.
 
+## Distribution models
+
+`external-archive` keeps the producer's archive outside Pako. The signed
+manifest contains every mirror URL, the producer archive's SHA-256 and size,
+format, strip count, and optional client-side declarative transforms. The
+client downloads and verifies the archive, applies those transforms, and
+verifies the resulting tree. Updates currently download the complete archive.
+
+`tuf-archive` stores both manifest and `package.tar.zst` in TUF. The builder
+creates the final tree and the manifest has `transforms = []`; the client only
+extracts and verifies it.
+
+```text
+catalog.json
+    ↓
+package manifest
+    ↓
+external URL or TUF archive target
+    ↓
+cache by SHA-256
+    ↓
+safe extraction
+    ↓
+optional external transforms
+    ↓
+tree verification
+    ↓
+atomic activation
+```
+
 ## Workspace components
 
 | Component | Responsibility |
@@ -82,7 +112,7 @@ $XDG_STATE_HOME/pako/
   transactions/<id>.json             recovery journal
   locks/                             package and integration locks
 
-$XDG_CACHE_HOME/pako/                downloaded archives and TUF data
+$XDG_CACHE_HOME/pako/artifacts/sha256/ downloaded archives by digest
 $XDG_CONFIG_HOME/pako/               repository configuration
 ```
 

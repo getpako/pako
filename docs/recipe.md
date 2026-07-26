@@ -6,6 +6,12 @@ installs signed package manifests and never downloads or executes recipe scripts
 The format is intentionally optimized for the common case: one prebuilt archive per architecture,
 a few payload adjustments, and optional desktop integration.
 
+Targets use `distribution = "external"` for a producer-hosted archive or
+`distribution = "hosted"` for an archive built and stored by Pako. External
+targets require one remote archive source, mirrors, SHA-256, size, and format;
+they cannot use local paths or build scripts. Hosted targets may use local or
+multiple sources and build scripts. Schema version remains `1`.
+
 ## Minimal recipe
 
 ```toml

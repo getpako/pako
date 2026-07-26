@@ -6,7 +6,7 @@ const ROOT_LONG_ABOUT: &str = "\
 Pako is a user-space package manager for Linux.
 
 Packages are installed into user-owned XDG directories. Pako resolves releases
-from a configured, trusted repository, downloads one verified payload archive,
+from a configured, trusted repository, downloads one verified package archive,
 verifies the complete package tree, and atomically
 activates the new version.
 
@@ -33,7 +33,7 @@ Pako resolves the requested package, release channel, and host architecture
 using signed repository metadata. It then downloads the package manifest and
 its verified upstream or TUF-hosted archive.
 
-The payload is extracted into a staging directory and the complete tree is
+The archive is extracted into a staging directory and the complete tree is
 verified before activation. Activation is atomic: an incomplete or invalid
 package never replaces the currently active version.
 
@@ -51,12 +51,12 @@ Examples:
 const UPGRADE_LONG_ABOUT: &str = "\
 Upgrade a package using its locally remembered release channel.
 
-The command uses the same transactional pipeline as installation. The payload
+The command uses the same transactional pipeline as installation. The archive
 is downloaded and the new tree is fully verified before it becomes active.
 
 The previously active version remains available as a rollback candidate. Use
 `--dry-run` to resolve metadata and print the download plan without downloading
-the payload or modifying the installation.";
+the archive or modifying the installation.";
 
 const UPGRADE_AFTER_HELP: &str = "\
 Examples:
@@ -312,7 +312,7 @@ pub(crate) struct UpgradeArgs {
     #[arg(long, value_name = "CHANNEL")]
     pub(crate) channel: Option<String>,
 
-    /// Print the resolved download plan without downloading the payload or changing
+    /// Print the resolved download plan without downloading the archive or changing
     /// the active installation.
     #[arg(long)]
     pub(crate) dry_run: bool,

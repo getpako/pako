@@ -37,6 +37,9 @@ The catalog points to a manifest target such as
 `manifests/example/1.0.0-1/linux-x86_64.json`. The manifest points to an archive
 target such as `artifacts/example/1.0.0-1/linux-x86_64.tar.zst`.
 
+External builds publish only the manifest. Hosted builds publish the manifest
+and `package.tar.zst`; the upstream archive is never copied to TUF.
+
 Installation uses signed TUF target names and immutable artifact digests.
 
 ## Local TUF repository

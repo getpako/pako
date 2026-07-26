@@ -29,7 +29,7 @@ Run `pako-build <COMMAND> --help` for detailed command documentation.";
 
 const LINT_LONG_ABOUT: &str = "\
 Parse and validate a Pako recipe without downloading sources or building a
-payload.
+package tree.
 
 Validation checks the recipe schema, package identity, target definitions,
 source declarations, SHA-256 values, architecture-specific configuration,
@@ -52,11 +52,11 @@ Build one architecture-specific target from a Pako recipe.
 
 For a prebuilt target, the builder downloads the target-specific source,
 verifies its declared digest, safely extracts it, applies the
-configured transforms, and validates the resulting payload.
+configured transforms, and validates the resulting package tree.
 
 For a source target, the builder prepares pinned sources and executes declared
 prepare, configure, build, check, and install stages inside the configured
-sandbox. The install stage must place the final payload in `PAKO_DESTDIR`.
+sandbox. The install stage must place the final package tree in `PAKO_DESTDIR`.
 
 After tree validation, the builder creates deterministic package metadata. An
 external package keeps its upstream archive URL and digest in the manifest;
