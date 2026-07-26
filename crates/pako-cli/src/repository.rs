@@ -1,4 +1,5 @@
 use crate::{cli::Concurrency, output::Ui};
+use fs2::FileExt;
 use futures_util::StreamExt;
 use pako_core::{
     installer::{InstallRequest, Installer},
@@ -8,7 +9,12 @@ use pako_core::{
 };
 use pako_trust::TrustedRepository;
 use serde::Deserialize;
-use std::{fs::File, path::PathBuf};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use tokio::{fs::File as AsyncFile, io::AsyncWriteExt};
 use url::Url;
 
@@ -182,47 +188,61 @@ async fn fetch_artifact(
     let cache = installer.layout().cache.join("artifacts/sha256");
     tokio::fs::create_dir_all(&cache).await?;
     let path = cache.join(plan.artifact.digest().hex());
-    if path.exists() {
-        let (digest, size) = Sha256Digest::calculate_reader(File::open(&path)?)?;
-        if digest == plan.artifact.digest() && size == plan.artifact.size() {
-            return Ok(path);
-        }
-        let _ = std::fs::remove_file(&path);
+    let lock_path = path.with_extension("lock");
+    let lock = File::create(&lock_path)?;
+    lock.lock_exclusive()?;
+    if valid_cached_artifact(&path, &plan.artifact)? {
+        ui.note("Artifact cache hit");
+        return Ok(path);
     }
-    let temporary = path.with_extension("partial");
+    let temporary = unique_partial_path(&path);
     match &plan.artifact {
         Artifact::TufArchive { target, .. } => {
-            plan.trusted.read_target_to_file(target, &temporary).await?;
+            if let Err(error) = plan.trusted.read_target_to_file(target, &temporary).await {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error);
+            }
         }
         Artifact::ExternalArchive { urls, .. } => {
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_mins(5))
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().last().is_some_and(|previous| {
+                        previous.scheme() == "https"
+                            && attempt.url().scheme() == "http"
+                            && !is_loopback(attempt.url())
+                    }) {
+                        return attempt.stop();
+                    }
+                    if attempt.previous().len() >= 5 {
+                        return attempt.stop();
+                    }
+                    attempt.follow()
+                }))
+                .build()?;
             let mut errors = Vec::new();
             for url in urls {
-                if url.scheme() != "https"
-                    && !(url.scheme() == "http"
-                        && url
-                            .host_str()
-                            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1")))
-                {
+                if !is_allowed_url(url) {
                     errors.push(format!("{url}: HTTPS required"));
                     continue;
                 }
-                match client
-                    .get(url.clone())
-                    .send()
-                    .await
-                    .and_then(reqwest::Response::error_for_status)
-                {
-                    Ok(response) => {
-                        let mut stream = response.bytes_stream();
-                        let mut file = AsyncFile::create(&temporary).await?;
-                        while let Some(chunk) = stream.next().await {
-                            file.write_all(&chunk?).await?;
+                let mirror_path = unique_partial_path(&path);
+                match download_mirror(&client, url, &mirror_path, plan.artifact.size(), ui).await {
+                    Ok(()) => {
+                        let (digest, size) =
+                            Sha256Digest::calculate_reader(File::open(&mirror_path)?)?;
+                        if digest == plan.artifact.digest() && size == plan.artifact.size() {
+                            std::fs::rename(&mirror_path, &temporary)?;
+                            break;
                         }
-                        file.flush().await?;
-                        break;
+                        errors.push(format!("{url}: digest or size mismatch"));
+                        let _ = std::fs::remove_file(&mirror_path);
                     }
-                    Err(error) => errors.push(format!("{url}: {error}")),
+                    Err(error) => {
+                        errors.push(format!("{url}: {error}"));
+                        let _ = std::fs::remove_file(&mirror_path);
+                    }
                 }
             }
             if !temporary.exists() {
@@ -236,8 +256,77 @@ async fn fetch_artifact(
         anyhow::bail!("downloaded artifact integrity mismatch");
     }
     std::fs::rename(&temporary, &path)?;
+    lock.unlock()?;
     ui.note("Artifact verified and cached");
     Ok(path)
+}
+
+static PARTIAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_partial_path(path: &Path) -> PathBuf {
+    let number = PARTIAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("partial-{}-{number}", std::process::id()))
+}
+
+fn valid_cached_artifact(path: &Path, artifact: &Artifact) -> anyhow::Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let (digest, size) = Sha256Digest::calculate_reader(File::open(path)?)?;
+    if digest == artifact.digest() && size == artifact.size() {
+        Ok(true)
+    } else {
+        let _ = std::fs::remove_file(path);
+        Ok(false)
+    }
+}
+
+fn is_loopback(url: &url::Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+}
+
+fn is_allowed_url(url: &url::Url) -> bool {
+    url.scheme() == "https" || (url.scheme() == "http" && is_loopback(url))
+}
+
+async fn download_mirror(
+    client: &reqwest::Client,
+    url: &url::Url,
+    path: &Path,
+    expected_size: u64,
+    ui: &Ui,
+) -> anyhow::Result<()> {
+    let response = client.get(url.clone()).send().await?;
+    let response = response.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|size| size != expected_size)
+    {
+        anyhow::bail!("Content-Length does not match manifest");
+    }
+    let progress = ui.download_progress(expected_size);
+    let mut stream = response.bytes_stream();
+    let mut file = AsyncFile::create(path).await?;
+    let mut downloaded = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        downloaded = downloaded
+            .checked_add(u64::try_from(chunk.len())?)
+            .ok_or_else(|| anyhow::anyhow!("download size overflow"))?;
+        if downloaded > expected_size {
+            progress.finish_and_clear();
+            anyhow::bail!("download exceeded manifest size");
+        }
+        file.write_all(&chunk).await?;
+        progress.set_position(downloaded);
+    }
+    file.flush().await?;
+    progress.finish_and_clear();
+    if downloaded != expected_size {
+        anyhow::bail!("download ended before manifest size");
+    }
+    Ok(())
 }
 fn host_target() -> String {
     format!(

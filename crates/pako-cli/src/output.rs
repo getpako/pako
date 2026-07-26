@@ -32,6 +32,18 @@ impl Ui {
         pako_log::suspend_progress(|| println!("{message}"));
     }
 
+    pub(crate) fn download_progress(self, total: u64) -> ProgressBar {
+        let progress = pako_log::add_progress(ProgressBar::new(total));
+        progress.set_style(
+            ProgressStyle::with_template(
+                "{msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
+            )
+            .expect("download progress template is valid"),
+        );
+        progress.set_message("Downloading artifact");
+        progress
+    }
+
     pub(crate) fn warning(self, message: impl std::fmt::Display) {
         log::warn!("{message}");
     }
