@@ -20,11 +20,17 @@ icon = "bin/idea.svg"
 categories = ["Development", "IDE"]
 
 [source.x86_64]
-url = "https://example.invalid/idea-linux-x86_64.tar.gz"
+distribution = "external"
+url = "http://127.0.0.1:8765/idea-linux-x86_64.tar.gz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size = 1
+format = "tar.gz"
 strip = 1
 
 [source.aarch64]
-url = "https://example.invalid/idea-linux-aarch64.tar.gz"
+distribution = "external"
+url = "http://127.0.0.1:8765/idea-linux-aarch64.tar.gz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size = 1
+format = "tar.gz"
 strip = 1
