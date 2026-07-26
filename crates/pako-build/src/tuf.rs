@@ -113,13 +113,13 @@ pub(crate) async fn init(directory: &Path) -> anyhow::Result<()> {
             packages: Vec::new(),
         })?,
     )?;
-    sign(directory, 1, &[]).await
+    sign(directory, 1).await
 }
 
 pub(crate) async fn refresh(directory: &Path) -> anyhow::Result<()> {
     let targets_metadata = directory.join("metadata/targets.json");
     let version = next_version(&targets_metadata)?;
-    sign(directory, version, &[]).await
+    sign(directory, version).await
 }
 
 pub(crate) async fn add_release(
@@ -132,7 +132,6 @@ pub(crate) async fn add_release(
     let manifest: PackageManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
     manifest.validate()?;
     let manifest_target = release.manifest_target.clone();
-    let mut published_targets = vec![manifest_target.clone()];
     copy_target(directory, &manifest_target, &manifest_path)?;
     if let Artifact::TufArchive { target, .. } = &manifest.artifact {
         let artifact_path = artifact_directory.join("package.tar.zst");
@@ -142,7 +141,6 @@ pub(crate) async fn add_release(
             anyhow::bail!("package archive does not match manifest");
         }
         copy_target(directory, target, &artifact_path)?;
-        published_targets.push(target.clone());
     }
 
     let catalog_path = directory.join("targets/catalog.json");
@@ -184,10 +182,6 @@ pub(crate) async fn add_release(
     sign(
         directory,
         next_version(&directory.join("metadata/targets.json"))?,
-        &published_targets
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
     )
     .await
 }
@@ -207,8 +201,9 @@ pub(crate) fn release(
     }
 }
 
-async fn sign(directory: &Path, version: u64, extra_targets: &[&str]) -> anyhow::Result<()> {
+async fn sign(directory: &Path, version: u64) -> anyhow::Result<()> {
     let metadata = directory.join("metadata");
+    let targets = directory.join("targets");
     let root = metadata.join("root.json");
     let key = directory.join("keys/targets-and-metadata.ed25519.pk8");
     let mut editor = RepositoryEditor::new(&root).await?;
@@ -219,18 +214,46 @@ async fn sign(directory: &Path, version: u64, extra_targets: &[&str]) -> anyhow:
         .snapshot_expires(now + SignedDuration::from_hours(30 * 24))
         .snapshot_version(NonZeroU64::new(version).unwrap())
         .timestamp_expires(now + SignedDuration::from_hours(7 * 24))
-        .timestamp_version(NonZeroU64::new(version).unwrap())
-        .add_target_path(directory.join("targets/catalog.json"))
-        .await?;
-    for target in extra_targets {
-        let path = directory.join("targets").join(target);
-        editor.add_target(TargetName::new(*target)?, Target::from_path(path).await?)?;
+        .timestamp_version(NonZeroU64::new(version).unwrap());
+    for path in target_paths(&targets)? {
+        let name = target_name(&targets, &path)?;
+        editor.add_target(TargetName::new(name)?, Target::from_path(path).await?)?;
     }
     let repository = editor
         .sign(&[Box::new(LocalKeySource { path: key })])
         .await?;
     repository.write(metadata).await?;
     Ok(())
+}
+
+fn target_paths(targets: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(targets).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy();
+        if file_name.ends_with(".partial") || file_name.contains(".partial-") {
+            continue;
+        }
+        paths.push(entry.into_path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn target_name(targets: &Path, path: &Path) -> anyhow::Result<String> {
+    path.strip_prefix(targets)?
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("target path is not valid UTF-8"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(|components| components.join("/"))
 }
 
 fn copy_target(directory: &Path, target: &str, source: &Path) -> anyhow::Result<()> {
@@ -249,4 +272,59 @@ fn next_version(path: &PathBuf) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("invalid targets version"))?
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("TUF version overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn signing_preserves_all_targets_across_publications_and_refresh() {
+        let parent = tempdir().expect("temporary directory");
+        let directory = parent.path().join("repository");
+        init(&directory).await.expect("initialize repository");
+
+        let targets = directory.join("targets");
+        for target in [
+            "manifests/package-a/1.0-1/linux-x86_64.json",
+            "manifests/package-b/1.0-1/linux-x86_64.json",
+            "manifests/package-a/2.0-1/linux-x86_64.json",
+            "artifacts/package-a/1.0-1/linux-x86_64.tar.zst",
+        ] {
+            let path = targets.join(target);
+            std::fs::create_dir_all(path.parent().expect("target parent"))
+                .expect("target directory");
+            std::fs::write(path, target).expect("target contents");
+        }
+
+        sign(&directory, 2).await.expect("sign publications");
+        let expected = BTreeSet::from([
+            "artifacts/package-a/1.0-1/linux-x86_64.tar.zst".to_owned(),
+            "manifests/package-a/1.0-1/linux-x86_64.json".to_owned(),
+            "manifests/package-a/2.0-1/linux-x86_64.json".to_owned(),
+            "manifests/package-b/1.0-1/linux-x86_64.json".to_owned(),
+            "catalog.json".to_owned(),
+        ]);
+        assert_eq!(signed_target_names(&directory), expected);
+
+        refresh(&directory).await.expect("refresh repository");
+        assert_eq!(signed_target_names(&directory), expected);
+    }
+
+    fn signed_target_names(directory: &Path) -> BTreeSet<String> {
+        let metadata = directory.join("metadata/targets.json");
+        let value: Value = serde_json::from_slice(&std::fs::read(metadata).expect("metadata"))
+            .expect("valid metadata");
+        value["signed"]["targets"]
+            .as_object()
+            .expect("targets map")
+            .keys()
+            .cloned()
+            .collect()
+    }
 }

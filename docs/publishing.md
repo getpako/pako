@@ -42,6 +42,10 @@ and `package.tar.zst`; the upstream archive is never copied to TUF.
 
 Installation uses signed TUF target names and immutable artifact digests.
 
+Each publication and `pako-build tuf refresh` signs the complete contents of
+the `targets/` directory, so previously published manifests and artifacts
+remain available.
+
 ## Local TUF repository
 
 Create a repository for development or CI experiments with:
